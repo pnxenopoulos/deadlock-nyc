@@ -19,6 +19,7 @@ import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { cn } from "@/lib/utils";
 
 type EventTab = "kills" | "abilities" | "objectives" | "chat";
+type ChatMode = "hero" | "player" | "fancy"
 
 // Future events (after the current tick) are shown but dimmed to this opacity.
 const FUTURE_OPACITY = "opacity-40";
@@ -64,9 +65,17 @@ export function EventLog({
   // Hero focus filters, kept per-tab. Empty set => show everyone; otherwise
   // only events involving a selected hero are shown.
   const [killFilter, setKillFilter] = React.useState<Set<number>>(new Set());
-  const [abilityFilter, setAbilityFilter] = React.useState<Set<number>>(
-    new Set(),
-  );
+  const [abilityFilter, setAbilityFilter] = React.useState<Set<number>>(new Set());
+  const [chatFilter, setChatFilter] = React.useState<Set<number>>(new Set());
+
+  const [chatMode, setChatMode] = React.useState<ChatMode>("hero")
+
+  const filter = {
+    "kills": { filter: killFilter, set: setKillFilter },
+    "abilities": { filter: abilityFilter, set: setAbilityFilter },
+    "chat": { filter: chatFilter, set: setChatFilter}
+  }
+
   const scrollRef = React.useRef<HTMLDivElement>(null);
 
   const heroById = React.useMemo(() => {
@@ -103,10 +112,13 @@ export function EventLog({
     [objectiveEvents],
   );
 
-  const visibleChat = React.useMemo(
-    () => chatEvents.slice().reverse(),
-    [chatEvents],
-  );
+  const visibleChat = React.useMemo(() => {
+    let out = chatEvents;
+    if (chatFilter.size > 0) {
+      out = out.filter((e) => chatFilter.has(e.hero_id));
+    }
+    return out.slice().reverse();
+  }, [chatEvents, chatFilter]);
 
   const toggle = (
     setFilter: React.Dispatch<React.SetStateAction<Set<number>>>,
@@ -148,14 +160,18 @@ export function EventLog({
         </TabsList>
       </Tabs>
 
-      {(tab === "kills" || tab === "abilities") && (
+      {(tab === "kills" || tab === "abilities" || tab === "chat") && (
         <HeroFilter
           players={players}
-          selected={tab === "kills" ? killFilter : abilityFilter}
+          selected={filter[tab].filter}
           onToggle={(id) =>
-            toggle(tab === "kills" ? setKillFilter : setAbilityFilter, id)
+            toggle(filter[tab].set, id)
           }
         />
+      )}
+
+      {(tab === "chat") && (
+        <ChatSettings mode={chatMode} onChange={setChatMode}/>
       )}
 
       <div
@@ -169,7 +185,7 @@ export function EventLog({
         ) : tab === "objectives" ? (
           <ObjectiveList events={visibleObjectives} {...feedProps} />
         ) : (
-          <ChatList events={visibleChat} {...feedProps} />
+          <ChatList events={visibleChat} mode={chatMode} {...feedProps} />
         )}
       </div>
     </div>
@@ -257,6 +273,35 @@ const NowDivider = React.forwardRef<HTMLLIElement, { label: string }>(
     );
   },
 );
+
+function ChatSettings({
+  mode,
+  onChange
+} : {
+  mode: ChatMode;
+  onChange: (mode: ChatMode) => void;
+}) {
+  return (
+    <Tabs
+        value={mode}
+        onValueChange={(v) => onChange(v as ChatMode)}
+        className="ml-auto flex-shrink-0"
+    >
+      <TabsList className="h-7">
+        <TabsTrigger value="hero" className="px-2 text-xs">
+          Hero
+        </TabsTrigger>
+        <TabsTrigger value="player" className="px-2 text-xs">
+          Player
+        </TabsTrigger>
+        <TabsTrigger value="fancy" className="px-2 text-xs">
+          Fancy
+        </TabsTrigger>
+      </TabsList>
+    </Tabs>
+  )
+}
+
 
 // Two rows of hero portraits (one per team). Click to focus the feed on that
 // hero; with nothing selected the feed shows everyone.
@@ -521,7 +566,8 @@ function ChatList({
   heroById,
   onSeek,
   onSelectPlayer,
-}: FeedProps & { events: ChatEvent[] }) {
+  mode,
+}: FeedProps & { events: ChatEvent[], mode: ChatMode }) {
   return (
     <Feed
       events={events}
@@ -534,7 +580,7 @@ function ChatList({
         const color = hero ? TEAM_COLORS[hero.team] : undefined;
         // Team chat gets a faint background in the sender's team color; all-chat
         // keeps the regular background.
-        const bg = !e.all_chat && color ? `${color}2e` : undefined;
+        const bg = !e.all_chat && color ? `${color}${mode !== "fancy" ? "2e" : ""}` : undefined;
         return (
           <li>
             <div
@@ -548,16 +594,16 @@ function ChatList({
                 }
               }}
               title="Jump to this moment"
-              style={bg ? { backgroundColor: bg } : undefined}
+              style={bg ? { "--chat-bg-color": bg } as React.CSSProperties : undefined}
               className={cn(
-                "flex w-full cursor-pointer gap-2 px-2 py-1.5 text-left transition-colors hover:bg-accent/40 focus-visible:bg-accent/40 focus-visible:outline-none",
+                `chat-row-${mode} flex w-full cursor-pointer gap-2 px-2 py-1.5 text-left transition-colors hover:bg-accent/40 focus-visible:bg-accent/40 focus-visible:outline-none`,
                 future && FUTURE_OPACITY,
               )}
             >
               <span className="mt-px flex-shrink-0 font-mono text-[10px] text-muted-foreground tabular-nums">
                 [{formatTick(e.tick)}]
               </span>
-              <span className="min-w-0 flex-1 break-words">
+              <span className={`min-w-0 flex-1 break-words chat-row team-${hero?.team} `}>
                 {hero ? (
                   <button
                     type="button"
@@ -569,15 +615,19 @@ function ChatList({
                     className="cursor-pointer font-medium hover:underline focus-visible:underline focus-visible:outline-none"
                     style={color ? { color } : undefined}
                   >
-                    {hero.hero_name}
+                    {mode === "fancy" ? <HeroPortrait hero={hero} size={42}/> : mode === "player" ? hero.name : hero.hero_name }
                   </button>
                 ) : (
                   <span className="font-medium text-muted-foreground">
                     Unknown
                   </span>
                 )}
-                <span className="text-muted-foreground">: </span>
-                <span className="text-foreground">{e.text}</span>
+                {mode === "fancy" ? (<span className="chat-bubble-text">{ e.text }</span>) : (
+                  <>
+                    <span className="text-muted-foreground">: </span>
+                    <span className="text-foreground">{e.text}</span>
+                  </>
+                )}
               </span>
             </div>
           </li>
@@ -585,6 +635,22 @@ function ChatList({
       }}
     />
   );
+}
+
+function HeroPortrait({hero, size}: {hero: PlayerInfo | undefined, size: number}) {
+  const url = hero ? heroPortraitUrl(hero.hero_id) : null;
+  return url ? (
+    <img
+        src={url}
+        alt=""
+        width={size}
+        height={size}
+        loading="lazy"
+        className={`size-[${size}px] flex-shrink-0 rounded object-contain`}
+    />
+  ) : (
+      <span className={`size-[${size}px] flex-shrink-0 rounded bg-muted`} />
+  )
 }
 
 function HeroChip({
@@ -596,22 +662,10 @@ function HeroChip({
   fallback: string;
   onSelect?: () => void;
 }) {
-  const url = hero ? heroPortraitUrl(hero.hero_id) : null;
   const color = hero ? TEAM_COLORS[hero.team] : undefined;
   const inner = (
     <>
-      {url ? (
-        <img
-          src={url}
-          alt=""
-          width={18}
-          height={18}
-          loading="lazy"
-          className="size-[18px] flex-shrink-0 rounded object-contain"
-        />
-      ) : (
-        <span className="size-[18px] flex-shrink-0 rounded bg-muted" />
-      )}
+      <HeroPortrait hero={hero} size={18}/>
       <span
         className="truncate font-medium"
         style={color ? { color } : undefined}

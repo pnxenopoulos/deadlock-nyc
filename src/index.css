@@ -155,3 +155,48 @@
     background-color: var(--brand-content);
   }
 }
+
+@layer chat {
+  @property --chat-bg-color {
+    syntax: "<color>";
+    inherits: true;
+    initial-value: none;
+  }
+
+  li:has(> .chat-row-fancy) {
+    border: none !important;
+  }
+
+  .chat-row-player, .chat-row-hero {
+    background: var(--chat-bg-color);
+  }
+
+  .chat-row-fancy {
+    display: flex;
+    align-items: center;
+    padding-block: .2rem;
+  }
+
+  .chat-row-fancy .chat-row {
+    display: flex;
+    align-items: center;
+    gap: .5rem;
+
+    .chat-bubble-text {
+      --skew: 3px;
+      clip-path: polygon(var(--skew) 0%, 100% 0%, calc(100% - var(--skew)) 100%, 0% 100%);
+      border-radius: 3px;
+      padding-block: .45rem;
+      padding-inline: .75rem;
+
+      --faded-col: color-mix(in srgb, var(--chat-bg-color) 50%, white);
+      background: var(--faded-col, white);
+      color: black;
+      font-weight: bold;
+    }
+
+    &.team-2 {
+      flex-direction: row-reverse;
+    }
+  }
+}
