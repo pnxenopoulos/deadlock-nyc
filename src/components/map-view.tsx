@@ -8,6 +8,7 @@ import {
   Gem,
   type LucideIcon,
   Maximize,
+  Orbit,
   Shield,
   ShieldHalf,
   Skull,
@@ -26,6 +27,7 @@ import {
   TooltipTrigger,
 } from "@/components/ui/tooltip";
 import { assetUrl, cn } from "@/lib/utils";
+import type { FrameStore } from "@/wasm/frames";
 
 export interface PlayerPosition {
   slot: number;
@@ -43,6 +45,8 @@ export interface PlayerPosition {
   pitch: number;
   health: number;
   max_health: number;
+  /** Current damage-absorbing barrier remaining; zero when unavailable. */
+  barrier: number;
   net_worth: number;
   ap_net_worth: number;
   kills: number;
@@ -125,8 +129,10 @@ export interface ResolvedPaths {
 }
 
 export interface PositionsResult {
+  game_mode: number;
+  match_mode: number;
   paths: ResolvedPaths;
-  frames: PositionFrame[];
+  frames: FrameStore;
   item_events: ItemEvent[];
   kill_events: KillEvent[];
   fire_events: FireEvent[];
@@ -152,12 +158,14 @@ export interface PositionsResult {
  * (`ability_id` for the icon, `ability_name` has the best name coverage); the
  * modifier's own `modifier_name` is a secondary label. Either name may be empty
  * but never both. `caster_hero_id` is the applying hero (0 = none / non-player),
- * `duration` is in seconds (-1 = indefinite), `stacks` is the count at apply.
+ * `duration` is in seconds (-1 = indefinite), and `applied_reg_tick` anchors
+ * the timer in non-paused match ticks.
  */
 export interface ModifierSpan {
   hero_id: number;
   start_tick: number;
   end_tick: number | null;
+  applied_reg_tick: number;
   ability_id: number;
   ability_name: string;
   modifier_name: string;
@@ -233,6 +241,14 @@ export interface ObjectiveState {
   color: string;
 }
 
+/** The Rift's live world position, reconstructed from sparse lifecycle events. */
+export interface RiftState {
+  x: number;
+  y: number;
+  color: string;
+  opacity: number;
+}
+
 /** Shared per-kind icon, used by both the map overlay and the feed. */
 export const OBJECTIVE_ICONS: Record<ObjectiveKind, LucideIcon> = {
   guardian: Shield,
@@ -242,6 +258,7 @@ export const OBJECTIVE_ICONS: Record<ObjectiveKind, LucideIcon> = {
   patron: Crown,
   mid_boss: Skull,
   urn: Amphora,
+  rift: Orbit,
   objective: Flag,
 };
 
@@ -254,7 +271,16 @@ export type ObjectiveKind =
   | "patron"
   | "mid_boss"
   | "urn"
+  | "rift"
   | "objective";
+
+export type ObjectiveAction =
+  | "destroyed"
+  | "killed"
+  | "spawns"
+  | "opened"
+  | "captured"
+  | "expired";
 
 /**
  * An objective destruction. `team` is the losing/owning team (−1/4 for the
@@ -264,6 +290,7 @@ export type ObjectiveKind =
 export interface ObjectiveEvent {
   tick: number;
   kind: ObjectiveKind;
+  action: ObjectiveAction;
   team: number;
   killer_hero_id: number;
   x: number | null;
@@ -321,6 +348,15 @@ export interface ObjectiveMarker {
 // when projecting into image space.
 export const WORLD_MIN = -10752;
 export const WORLD_SIZE = 21504;
+
+// Deadlock map coordinates use Source/Hammer units (approximately one inch).
+// Keep the gameplay-facing radius in metres and convert only for map drawing.
+export const RIFT_RADIUS_METERS = 20;
+const SOURCE_UNITS_PER_METER = 39.37007874;
+const RIFT_RADIUS_WORLD_UNITS =
+  RIFT_RADIUS_METERS * SOURCE_UNITS_PER_METER;
+export const RIFT_COLOR = "#22d3ee";
+const RIFT_MARKER_R = 260;
 
 // Sizes are in viewBox (world) units. WORLD_SIZE = 21504, so a dot inner
 // radius of 450 ≈ 2.1% of the map width — roughly 17px on a 800px map.
@@ -451,6 +487,7 @@ export function MapView({
   killMarkers,
   objectiveMarkers,
   objectiveStates,
+  rift,
   campStates,
   firing,
   onSelectPlayer,
@@ -461,6 +498,7 @@ export function MapView({
   killMarkers?: KillMarker[];
   objectiveMarkers?: ObjectiveMarker[];
   objectiveStates?: ObjectiveState[];
+  rift?: RiftState | null;
   campStates?: NeutralCampState[];
   /** hero_id → gun shots fired in the current frame's window (count > 0). */
   firing?: Map<number, number>;
@@ -769,6 +807,40 @@ export function MapView({
                 </g>
               );
             })}
+            {/* The live Rift capture area. Its 20 m radius stays in world
+                space while the badge and border remain legible when zoomed. */}
+            {layer === "surface" && layers.objectives && rift && (
+              <g
+                transform={`translate(${rift.x - WORLD_MIN} ${WORLD_SIZE - (rift.y - WORLD_MIN)})`}
+                opacity={rift.opacity}
+                style={{ pointerEvents: "none" }}
+              >
+                <title>{`Rift (${RIFT_RADIUS_METERS} m radius)`}</title>
+                <circle
+                  r={RIFT_RADIUS_WORLD_UNITS}
+                  fill="#000"
+                  fillOpacity={0.16}
+                  stroke={rift.color}
+                  strokeWidth={70 / zoom}
+                />
+                <g transform={`scale(${1 / zoom})`}>
+                  <circle
+                    r={RIFT_MARKER_R}
+                    fill="rgba(12,14,22,0.88)"
+                    stroke={rift.color}
+                    strokeWidth={75}
+                  />
+                  <image
+                    href={assetUrl("/objectives/minimap_icon_koth.svg")}
+                    x={-RIFT_MARKER_R * 0.58}
+                    y={-RIFT_MARKER_R * 0.58}
+                    width={RIFT_MARKER_R * 1.16}
+                    height={RIFT_MARKER_R * 1.16}
+                    preserveAspectRatio="xMidYMid meet"
+                  />
+                </g>
+              </g>
+            )}
             {layers.heroes &&
               frame?.players.map((p) => {
               const cx = p.x - WORLD_MIN;

@@ -17,6 +17,7 @@ pub struct DemoParser {
 const PAWN_CLASS: &str = "CCitadelPlayerPawn";
 const CONTROLLER_CLASS: &str = "CCitadelPlayerController";
 const GAMERULES_CLASS: &str = "CCitadelGameRulesProxy";
+const BARRIER_TRACKER_MODIFIER_ID: u32 = 4_267_845_006;
 
 /// Networked classes of the destructible objectives, used to label
 /// `k_EUserMsg_BossKilled` events for the objectives feed. The killed entity is
@@ -65,6 +66,21 @@ const IDOL_CLASS: &str = "CCitadelItemPickupIdol";
 /// the demo gives us no clean end-signal for).
 const URN_PICKUP_RADIUS: f32 = 350.0;
 const URN_CARRY_MAX_TICKS: i32 = 90 * 64;
+
+/// Every current hero exposes four ESlot_Signature_N abilities. The network
+/// vector has eight storage slots, but unused trailing slots can retain a
+/// previous hero's IDs during initialization.
+const SIGNATURE_ABILITY_SLOTS: usize = 4;
+
+/// The game clears the Rift location to FLT_MAX when it resolves. This sanity
+/// bound rejects that finite sentinel and any other implausible map coordinate.
+const RIFT_COORD_SANITY: f32 = 1.0e6;
+
+fn rift_xy(location: Option<[f32; 3]>) -> (Option<f32>, Option<f32>) {
+    location
+        .map(|point| (Some(point[0]), Some(point[1])))
+        .unwrap_or((None, None))
+}
 
 /// Clustering / occupancy radius for grouping creeps into a camp (world units).
 /// Tuned so a camp's spread (~600) groups but adjacent camps (~1000+) don't.
@@ -195,17 +211,18 @@ impl DemoParser {
     /// demo doesn't contain one (e.g. it ended before the match did).
     #[wasm_bindgen(js_name = gameWinner)]
     pub fn game_winner(&self) -> Result<JsValue, JsError> {
-        use boon_proto::proto::{
-            CCitadelUserMessageGameOver, CitadelUserMessageIds as Msg,
-        };
+        use boon_proto::proto::{CCitadelUserMessageGameOver, CitadelUserMessageIds as Msg};
         use prost::Message;
 
-        let events = self.inner.events(None).map_err(to_js_error)?;
+        let event_types = [Msg::KEUserMsgGameOver as u32].into_iter().collect();
+        let events = self
+            .inner
+            .events_filtered(None, &event_types)
+            .map_err(to_js_error)?;
         let mut winner: Option<i32> = None;
         for event in &events {
             if event.msg_type == Msg::KEUserMsgGameOver as u32
-                && let Ok(msg) =
-                    CCitadelUserMessageGameOver::decode(event.payload.as_slice())
+                && let Ok(msg) = CCitadelUserMessageGameOver::decode(event.payload.as_slice())
             {
                 winner = msg.winning_team;
             }
@@ -225,7 +242,13 @@ impl DemoParser {
         };
         use prost::Message;
 
-        let events = self.inner.events(None).map_err(to_js_error)?;
+        let event_types = [Msg::KEUserMsgPostMatchDetails as u32]
+            .into_iter()
+            .collect();
+        let events = self
+            .inner
+            .events_filtered(None, &event_types)
+            .map_err(to_js_error)?;
         let mut snapshots: Vec<SnapshotStat> = Vec::new();
         let mut damage_sample_times: Vec<u32> = Vec::new();
         let mut damage_matrix: Vec<DamagePair> = Vec::new();
@@ -234,8 +257,7 @@ impl DemoParser {
             if event.msg_type != Msg::KEUserMsgPostMatchDetails as u32 {
                 continue;
             }
-            let Ok(outer) =
-                CCitadelUserMsgPostMatchDetails::decode(event.payload.as_slice())
+            let Ok(outer) = CCitadelUserMsgPostMatchDetails::decode(event.payload.as_slice())
             else {
                 continue;
             };
@@ -302,19 +324,14 @@ impl DemoParser {
                     .iter()
                     .filter_map(|p| p.player_slot.map(|slot| (slot, p.hero_id())))
                     .collect();
-                let (names, stats): (&[String], &[i32]) =
-                    match matrix.source_details.as_ref() {
-                        Some(sd) => {
-                            (sd.source_name.as_slice(), sd.stat_type.as_slice())
-                        }
-                        None => (&[], &[]),
-                    };
+                let (names, stats): (&[String], &[i32]) = match matrix.source_details.as_ref() {
+                    Some(sd) => (sd.source_name.as_slice(), sd.stat_type.as_slice()),
+                    None => (&[], &[]),
+                };
                 let mut pair_totals: HashMap<(u32, u32), u32> = HashMap::new();
                 let mut series: HashMap<(u32, String), Vec<u32>> = HashMap::new();
                 for dealer in &matrix.damage_dealers {
-                    let Some(&dhero) =
-                        slot_to_hero.get(&dealer.dealer_player_slot())
-                    else {
+                    let Some(&dhero) = slot_to_hero.get(&dealer.dealer_player_slot()) else {
                         continue;
                     };
                     if dhero == 0 {
@@ -346,14 +363,11 @@ impl DemoParser {
                                         s[i] = s[i].saturating_add(cum);
                                     }
                                 }
-                            } else if let Some(&thero) =
-                                slot_to_hero.get(&dtp.target_player_slot())
+                            } else if let Some(&thero) = slot_to_hero.get(&dtp.target_player_slot())
                             {
                                 // Final cumulative value = total for this pair.
                                 if thero != 0 {
-                                    *pair_totals
-                                        .entry((dhero, thero))
-                                        .or_insert(0) +=
+                                    *pair_totals.entry((dhero, thero)).or_insert(0) +=
                                         arr.last().copied().unwrap_or(0);
                                 }
                             }
@@ -393,7 +407,7 @@ impl DemoParser {
     pub fn serializer_fields(&self, class_name: &str) -> Result<JsValue, JsError> {
         let ctx = self.inner.parse_init().map_err(to_js_error)?;
         let serializer = ctx
-            .serializers
+            .serializers()
             .get(class_name)
             .ok_or_else(|| JsError::new(&format!("class {class_name} not found")))?;
         let mut paths: Vec<String> = Vec::new();
@@ -401,8 +415,8 @@ impl DemoParser {
         serde_wasm_bindgen::to_value(&paths).map_err(|e| JsError::new(&e.to_string()))
     }
 
-    /// Roster from CCitadelPlayerController: name, hero, team. Hero ID is
-    /// resolved to a name via boon's lookup table.
+    /// Roster from CCitadelPlayerController: name, hero, team, and packed rank.
+    /// Hero ID is resolved to a name via boon's lookup table.
     #[wasm_bindgen(js_name = players)]
     pub fn players(&self) -> Result<JsValue, JsError> {
         let class_filter: HashSet<&str> = [CONTROLLER_CLASS].into_iter().collect();
@@ -411,30 +425,33 @@ impl DemoParser {
         let mut nk_team: Option<u64> = None;
         let mut nk_name: Option<u64> = None;
         let mut nk_hero: Option<u64> = None;
+        let mut nk_rank: Option<u64> = None;
 
         let mut roster: HashMap<i32, PlayerInfo> = HashMap::new();
 
         self.inner
             .run_to_end_filtered(&class_filter, |ctx| {
                 if !keys_resolved {
-                    if let Some(s) = ctx.serializers.get(CONTROLLER_CLASS) {
+                    if let Some(s) = ctx.serializers().get(CONTROLLER_CLASS) {
                         nk_team = s.resolve_field_key("m_iTeamNum");
                         nk_name = s.resolve_field_key("m_iszPlayerName");
                         nk_hero = s.resolve_field_key("m_PlayerDataGlobal.m_nHeroID");
+                        nk_rank = s.resolve_field_key("m_PlayerDataGlobal.m_unPackedRank");
                         keys_resolved = true;
                     } else {
                         return;
                     }
                 }
 
-                for (&idx, entity) in ctx.entities.iter() {
-                    if entity.class_name != CONTROLLER_CLASS {
+                for (idx, entity) in ctx.entities().iter() {
+                    if entity.class_name.as_ref() != CONTROLLER_CLASS {
                         continue;
                     }
 
                     let team = get_i64(entity, nk_team) as i32;
                     let name = get_string(entity, nk_name);
                     let hero_id = get_i64(entity, nk_hero);
+                    let rank = get_i64(entity, nk_rank);
                     let hero_name = if hero_id > 0 {
                         boon::hero_name(hero_id).to_string()
                     } else {
@@ -446,6 +463,7 @@ impl DemoParser {
                         hero_id: 0,
                         hero_name: String::new(),
                         team: 0,
+                        rank: 0,
                     });
                     if !name.is_empty() {
                         entry.name = name;
@@ -456,6 +474,9 @@ impl DemoParser {
                     }
                     if team != 0 {
                         entry.team = team;
+                    }
+                    if rank > 0 {
+                        entry.rank = rank;
                     }
                 }
             })
@@ -491,10 +512,9 @@ impl DemoParser {
             .inner
             .parse_send_tables()
             .map(|sc| {
-                sc.serializers
-                    .keys()
-                    .filter(|n| n.contains("Ability"))
-                    .cloned()
+                sc.iter()
+                    .filter(|(name, _)| name.contains("Ability"))
+                    .map(|(name, _)| name.to_owned())
                     .collect()
             })
             .unwrap_or_default();
@@ -546,6 +566,9 @@ impl DemoParser {
         // Controller keys
         let mut ctrl_keys_resolved = false;
         let mut ck_hero: Option<u64> = None;
+        let mut ck_team: Option<u64> = None;
+        let mut ck_name: Option<u64> = None;
+        let mut ck_rank: Option<u64> = None;
         let mut ck_net_worth: Option<u64> = None;
         let mut ck_ap_net_worth: Option<u64> = None;
         let mut ck_kills: Option<u64> = None;
@@ -557,17 +580,18 @@ impl DemoParser {
         let mut ck_health_max: Option<u64> = None;
         // (eValType key, value key) pairs for the 20 stat-modifier slots on
         // m_PlayerDataGlobal.m_vecStatViewerModifierValues.
-        let mut ck_stat_keys: Vec<(Option<u64>, Option<u64>)> =
-            Vec::with_capacity(20);
-        // (m_ItemID key, m_nUpgradeInfo key) pairs for the 8 ability-upgrade
-        // slots on m_PlayerDataGlobal.m_vecAbilityUpgradeState — the hero's
-        // signature abilities and their spent upgrade tiers.
+        let mut ck_stat_keys: Vec<(Option<u64>, Option<u64>)> = Vec::with_capacity(20);
+        // (m_ItemID key, m_nUpgradeInfo key) pairs for the four signature slots
+        // on m_PlayerDataGlobal.m_vecAbilityUpgradeState.
         let mut ck_ability_keys: Vec<(Option<u64>, Option<u64>)> =
-            Vec::with_capacity(8);
+            Vec::with_capacity(SIGNATURE_ABILITY_SLOTS);
 
-        let mut frames: Vec<PositionFrame> = Vec::new();
+        let frame_capacity = (total_ticks.max(0) as usize / step as usize).saturating_add(1);
+        let mut frames = PackedFrames::with_capacity(frame_capacity);
         let mut pawn_to_hero: HashMap<i32, i64> = HashMap::new();
         let mut slot_to_hero: HashMap<i32, i64> = HashMap::new();
+        let mut roster: HashMap<i32, PlayerInfo> = HashMap::new();
+        let mut winner: Option<i32> = None;
         let mut item_events_raw: Vec<RawItemEvent> = Vec::new();
         let mut kill_events_raw: Vec<RawKillEvent> = Vec::new();
         let mut ability_events_raw: Vec<RawAbilityEvent> = Vec::new();
@@ -652,6 +676,20 @@ impl DemoParser {
         // pauses come from CCitadelGameRulesProxy.m_pGameRules.m_bGamePaused.
         let mut gr_keys_resolved = false;
         let mut gk_paused: Option<u64> = None;
+        let mut gk_game_mode: Option<u64> = None;
+        let mut gk_match_mode: Option<u64> = None;
+        let mut game_mode: i32 = 0;
+        let mut match_mode: i32 = 0;
+        // Rift (Koth) lifecycle fields, also carried by the game-rules entity.
+        let mut rk_cashin_started: Option<u64> = None;
+        let mut rk_scoring_team: Option<u64> = None;
+        let mut rk_location: Option<u64> = None;
+
+        // A Rift opens, then resolves exactly once by capture or expiration.
+        let mut rift_live = false;
+        let mut rift_captured = false;
+        let mut rift_seen_contested = false;
+        let mut rift_location: Option<[f32; 3]> = None;
         let mut prev_tick: Option<i32> = None;
         let mut prev_paused = false;
         let mut active_ticks: i32 = 0;
@@ -673,6 +711,10 @@ impl DemoParser {
         let mut mod_idx_serial: HashMap<usize, u32> = HashMap::new();
         let mut mod_open: HashMap<u32, OpenModifier> = HashMap::new();
         let mut modifier_spans: Vec<ModifierSpan> = Vec::new();
+        // Barrier is not a pawn send-table field. Its persistent tracker uses
+        // float1 for capacity and float2 for current remaining barrier.
+        let mut barrier_by_pawn: HashMap<i32, f32> = HashMap::new();
+        let mut barrier_serial_pawn: HashMap<u32, i32> = HashMap::new();
 
         // --- Ability cooldowns (per-ability entity state) -----------------
         // Each ability entity carries cooldown/charge fields; we diff them every
@@ -695,55 +737,164 @@ impl DemoParser {
         let mut abil_prev: HashMap<i32, (f32, f32, i32, f32, f32)> = HashMap::new();
         let mut ability_ticks: Vec<AbilityTick> = Vec::new();
 
+        use boon_proto::proto::{CitadelUserMessageIds as Msg, ECitadelGameEvents};
+        let event_types: HashSet<u32> = [
+            Msg::KEUserMsgAbilitiesChanged as u32,
+            Msg::KEUserMsgHeroKilled as u32,
+            Msg::KEUserMsgGameOver as u32,
+            Msg::KEUserMsgImportantAbilityUsed as u32,
+            Msg::KEUserMsgBossKilled as u32,
+            Msg::KEUserMsgChatMsg as u32,
+            ECitadelGameEvents::GeFireBullets as u32,
+        ]
+        .into_iter()
+        .collect();
+
         self.inner
-            .run_to_end_with_events_filtered(&class_filter, |ctx, events| {
+            .run_to_end_with_event_types_filtered(&class_filter, &event_types, |ctx, events| {
                 // --- report parse progress (throttled) ---
                 // saturating_sub: last_progress_tick starts at i32::MIN, so a
                 // plain subtraction would overflow and the bar would never
                 // advance until the final 100% call.
-                if ctx.tick.saturating_sub(last_progress_tick) >= PROGRESS_EVERY {
-                    last_progress_tick = ctx.tick;
+                if ctx.tick().saturating_sub(last_progress_tick) >= PROGRESS_EVERY {
+                    last_progress_tick = ctx.tick();
                     let _ = progress.call2(
                         &JsValue::NULL,
-                        &JsValue::from(ctx.tick),
+                        &JsValue::from(ctx.tick()),
                         &JsValue::from(total_ticks),
                     );
                 }
 
                 // --- pause / regulation tracking (runs every tick) ---
-                if !gr_keys_resolved
-                    && let Some(s) = ctx.serializers.get(GAMERULES_CLASS)
-                {
+                if !gr_keys_resolved && let Some(s) = ctx.serializers().get(GAMERULES_CLASS) {
                     gk_paused = s.resolve_field_key("m_pGameRules.m_bGamePaused");
+                    gk_game_mode = s.resolve_field_key("m_pGameRules.m_eGameMode");
+                    gk_match_mode = s.resolve_field_key("m_pGameRules.m_eMatchMode");
+                    rk_cashin_started = s.resolve_field_key("m_pGameRules.m_timeKothCashInStarted");
+                    rk_scoring_team = s.resolve_field_key("m_pGameRules.m_nKothScoringTeam");
+                    rk_location = s.resolve_field_key("m_pGameRules.m_vKothCashInCurrentLocation");
                     gr_keys_resolved = true;
                 }
-                let paused_now = ctx
-                    .entities
+                let game_rules = ctx
+                    .entities()
                     .iter()
-                    .find(|(_, e)| e.class_name == GAMERULES_CLASS)
-                    .map(|(_, e)| e.get_bool(gk_paused))
+                    .find(|(_, e)| e.class_name.as_ref() == GAMERULES_CLASS)
+                    .map(|(_, e)| e);
+                if let Some(entity) = game_rules {
+                    let observed_game_mode = entity.get_i64(gk_game_mode) as i32;
+                    let observed_match_mode = entity.get_i64(gk_match_mode) as i32;
+                    if observed_game_mode != 0 {
+                        game_mode = observed_game_mode;
+                    }
+                    if observed_match_mode != 0 {
+                        match_mode = observed_match_mode;
+                    }
+                }
+                let paused_now = game_rules
+                    .map(|e| e.get_bool(gk_paused))
                     .unwrap_or(prev_paused);
                 if let Some(pt) = prev_tick
                     && !prev_paused
                 {
                     // Attribute the elapsed ticks to the (prior) play state.
-                    active_ticks += (ctx.tick - pt).max(0);
+                    active_ticks += (ctx.tick() - pt).max(0);
                 }
                 if paused_now && !prev_paused {
-                    cur_pause_start = Some(ctx.tick);
+                    cur_pause_start = Some(ctx.tick());
                 } else if !paused_now
                     && prev_paused
                     && let Some(start) = cur_pause_start.take()
                 {
-                    pause_intervals.push(PauseInterval { start, end: ctx.tick });
+                    pause_intervals.push(PauseInterval {
+                        start,
+                        end: ctx.tick(),
+                    });
                 }
-                prev_tick = Some(ctx.tick);
+                prev_tick = Some(ctx.tick());
                 prev_paused = paused_now;
 
-                // Keep each live objective entity's kind cached by index. Only
-                // writes on change, so this is cheap despite running per tick.
-                for (&idx, e) in ctx.entities.iter() {
-                    if OBJ_CLASSES.contains(&e.class_name.as_str()) {
+                // --- Rift (Koth) lifecycle --------------------------------
+                // This mirrors boon's Rift dataset: the cash-in timer marks the
+                // live window, while the scoring team gives the final winner.
+                if let Some(entity) = game_rules {
+                    let cashin_started = entity.get_f32(rk_cashin_started);
+                    let is_live = cashin_started > 0.0 && cashin_started.is_finite();
+                    let scoring_team = entity.get_i64(rk_scoring_team) as i32;
+                    let opened = is_live && !rift_live;
+
+                    if opened {
+                        rift_live = true;
+                        rift_captured = false;
+                        rift_seen_contested = scoring_team <= 0;
+                        rift_location = None;
+                    }
+
+                    if rift_live {
+                        // Read the location only while live: the resolving tick
+                        // replaces it with FLT_MAX.
+                        if is_live {
+                            let location = entity.get_vector3(rk_location);
+                            if location != [0.0; 3]
+                                && location
+                                    .iter()
+                                    .all(|coordinate| coordinate.abs() < RIFT_COORD_SANITY)
+                            {
+                                rift_location = Some(location);
+                            }
+                        }
+
+                        if opened {
+                            let (x, y) = rift_xy(rift_location);
+                            objective_events_raw.push(RawObjectiveEvent {
+                                tick: ctx.tick(),
+                                kind: "rift",
+                                action: "opened",
+                                team: -1,
+                                killer_pawn: -1,
+                                x,
+                                y,
+                            });
+                        }
+
+                        if scoring_team <= 0 {
+                            rift_seen_contested = true;
+                        } else if rift_seen_contested && !rift_captured {
+                            rift_captured = true;
+                            let (x, y) = rift_xy(rift_location);
+                            objective_events_raw.push(RawObjectiveEvent {
+                                tick: ctx.tick(),
+                                kind: "rift",
+                                action: "captured",
+                                team: scoring_team,
+                                killer_pawn: -1,
+                                x,
+                                y,
+                            });
+                        }
+                    }
+
+                    if !is_live && rift_live {
+                        if !rift_captured {
+                            let (x, y) = rift_xy(rift_location);
+                            objective_events_raw.push(RawObjectiveEvent {
+                                tick: ctx.tick(),
+                                kind: "rift",
+                                action: "expired",
+                                team: -1,
+                                killer_pawn: -1,
+                                x,
+                                y,
+                            });
+                        }
+                        rift_live = false;
+                    }
+                }
+                // Keep each changed objective entity's kind cached by index.
+                for &idx in ctx.entities().updated_indices() {
+                    let Some(e) = ctx.entities().get(idx) else {
+                        continue;
+                    };
+                    if OBJ_CLASSES.contains(&e.class_name.as_ref()) {
                         let kind = objective_kind(&e.class_name);
                         if obj_kind_by_idx.get(&idx) != Some(&kind) {
                             obj_kind_by_idx.insert(idx, kind);
@@ -752,9 +903,7 @@ impl DemoParser {
                 }
 
                 // Resolve the Urn's position keys once it first appears.
-                if !idol_keys_resolved
-                    && let Some(s) = ctx.serializers.get(IDOL_CLASS)
-                {
+                if !idol_keys_resolved && let Some(s) = ctx.serializers().get(IDOL_CLASS) {
                     let o = "CBodyComponent.m_skeletonInstance.m_vecOrigin";
                     idk_cell_x = s.resolve_field_key(&format!("{o}.m_cellX"));
                     idk_vec_x = s.resolve_field_key(&format!("{o}.m_vecX"));
@@ -770,19 +919,13 @@ impl DemoParser {
                 // (no event — just end the carry). An idol that vanishes next to
                 // a living hero was picked up by that hero.
                 idol_now.clear();
-                for (&idx, e) in ctx.entities.iter() {
-                    if e.class_name != IDOL_CLASS {
+                for (idx, e) in ctx.entities().iter() {
+                    if e.class_name.as_ref() != IDOL_CLASS {
                         continue;
                     }
                     idol_now.insert(idx);
-                    let ux = cell_to_world(
-                        get_i64(e, idk_cell_x) as i32,
-                        get_f32(e, idk_vec_x),
-                    );
-                    let uy = cell_to_world(
-                        get_i64(e, idk_cell_y) as i32,
-                        get_f32(e, idk_vec_y),
-                    );
+                    let ux = cell_to_world(get_i64(e, idk_cell_x) as i32, get_f32(e, idk_vec_x));
+                    let uy = cell_to_world(get_i64(e, idk_cell_y) as i32, get_f32(e, idk_vec_y));
                     idol_last_pos.insert(idx, (ux, uy));
                     if !idol_prev.contains(&idx) {
                         if carrier_pawn.is_some() {
@@ -791,8 +934,9 @@ impl DemoParser {
                             carrier_pawn = None;
                         } else {
                             objective_events_raw.push(RawObjectiveEvent {
-                                tick: ctx.tick,
+                                tick: ctx.tick(),
                                 kind: "urn",
+                                action: "spawns",
                                 team: get_i64(e, idk_team) as i32,
                                 killer_pawn: -1,
                                 x: Some(ux),
@@ -806,23 +950,14 @@ impl DemoParser {
                     if idol_now.contains(&idx) {
                         continue;
                     }
-                    let (lx, ly) =
-                        idol_last_pos.remove(&idx).unwrap_or((0.0, 0.0));
+                    let (lx, ly) = idol_last_pos.remove(&idx).unwrap_or((0.0, 0.0));
                     let mut best = (f32::MAX, -1i32);
-                    for (&pidx, pe) in ctx.entities.iter() {
-                        if pe.class_name != PAWN_CLASS
-                            || get_i64(pe, pk_life) != 0
-                        {
+                    for (pidx, pe) in ctx.entities().iter() {
+                        if pe.class_name.as_ref() != PAWN_CLASS || get_i64(pe, pk_life) != 0 {
                             continue;
                         }
-                        let x = cell_to_world(
-                            get_i64(pe, pk_cell_x) as i32,
-                            get_f32(pe, pk_x),
-                        );
-                        let y = cell_to_world(
-                            get_i64(pe, pk_cell_y) as i32,
-                            get_f32(pe, pk_y),
-                        );
+                        let x = cell_to_world(get_i64(pe, pk_cell_x) as i32, get_f32(pe, pk_x));
+                        let y = cell_to_world(get_i64(pe, pk_cell_y) as i32, get_f32(pe, pk_y));
                         let d = ((x - lx).powi(2) + (y - ly).powi(2)).sqrt();
                         if d < best.0 {
                             best = (d, pidx);
@@ -830,37 +965,30 @@ impl DemoParser {
                     }
                     if best.0 < URN_PICKUP_RADIUS {
                         carrier_pawn = Some(best.1);
-                        carry_start = ctx.tick;
+                        carry_start = ctx.tick();
                     }
                 }
                 std::mem::swap(&mut idol_prev, &mut idol_now);
                 // End a carry when the carrier dies / disappears, or the backstop
                 // timeout elapses.
                 if let Some(cp) = carrier_pawn {
-                    let ended = match ctx.entities.get(cp) {
-                        Some(e) if e.class_name == PAWN_CLASS => {
-                            get_i64(e, pk_life) != 0
-                        }
+                    let ended = match ctx.entities().get(cp) {
+                        Some(e) if e.class_name.as_ref() == PAWN_CLASS => get_i64(e, pk_life) != 0,
                         _ => true,
-                    } || ctx.tick.saturating_sub(carry_start)
-                        > URN_CARRY_MAX_TICKS;
+                    } || ctx.tick().saturating_sub(carry_start) > URN_CARRY_MAX_TICKS;
                     if ended {
                         carrier_pawn = None;
                     }
                 }
 
-                if !pawn_keys_resolved
-                    && let Some(s) = ctx.serializers.get(PAWN_CLASS)
-                {
+                if !pawn_keys_resolved && let Some(s) = ctx.serializers().get(PAWN_CLASS) {
                     let mut all_paths: Vec<String> = Vec::new();
                     walk_fields(s, "", &mut all_paths);
 
                     let find = |suffix: &str| -> Option<(String, u64)> {
                         all_paths
                             .iter()
-                            .find(|p| {
-                                p == &suffix || p.ends_with(&format!(".{suffix}"))
-                            })
+                            .find(|p| p == &suffix || p.ends_with(&format!(".{suffix}")))
                             .and_then(|p| s.resolve_field_key(p).map(|k| (p.clone(), k)))
                     };
 
@@ -880,9 +1008,8 @@ impl DemoParser {
                     pk_cell_y = kcy;
                     pk_cell_z = kcz;
                     pk_team = s.resolve_field_key("m_iTeamNum");
-                    pk_hero = s.resolve_field_key(
-                        "m_CCitadelHeroComponent.m_spawnedHero.m_nHeroID",
-                    );
+                    pk_hero =
+                        s.resolve_field_key("m_CCitadelHeroComponent.m_spawnedHero.m_nHeroID");
                     pk_life = s.resolve_field_key("m_lifeState");
                     pk_health = s.resolve_field_key("m_iHealth");
                     pk_max_health = s.resolve_field_key("m_iMaxHealth");
@@ -902,31 +1029,25 @@ impl DemoParser {
                     pawn_keys_resolved = true;
                 }
 
-                if !ctrl_keys_resolved
-                    && let Some(s) = ctx.serializers.get(CONTROLLER_CLASS)
-                {
+                if !ctrl_keys_resolved && let Some(s) = ctx.serializers().get(CONTROLLER_CLASS) {
                     ck_hero = s.resolve_field_key("m_PlayerDataGlobal.m_nHeroID");
-                    ck_net_worth =
-                        s.resolve_field_key("m_PlayerDataGlobal.m_iGoldNetWorth");
-                    ck_ap_net_worth =
-                        s.resolve_field_key("m_PlayerDataGlobal.m_iAPNetWorth");
-                    ck_kills =
-                        s.resolve_field_key("m_PlayerDataGlobal.m_iPlayerKills");
+                    ck_team = s.resolve_field_key("m_iTeamNum");
+                    ck_name = s.resolve_field_key("m_iszPlayerName");
+                    ck_rank = s.resolve_field_key("m_PlayerDataGlobal.m_unPackedRank");
+                    ck_net_worth = s.resolve_field_key("m_PlayerDataGlobal.m_iGoldNetWorth");
+                    ck_ap_net_worth = s.resolve_field_key("m_PlayerDataGlobal.m_iAPNetWorth");
+                    ck_kills = s.resolve_field_key("m_PlayerDataGlobal.m_iPlayerKills");
                     ck_deaths = s.resolve_field_key("m_PlayerDataGlobal.m_iDeaths");
-                    ck_assists =
-                        s.resolve_field_key("m_PlayerDataGlobal.m_iPlayerAssists");
-                    ck_damage =
-                        s.resolve_field_key("m_PlayerDataGlobal.m_iHeroDamage");
-                    ck_healing =
-                        s.resolve_field_key("m_PlayerDataGlobal.m_iHeroHealing");
-                    ck_objective_damage = s
-                        .resolve_field_key("m_PlayerDataGlobal.m_iObjectiveDamage");
+                    ck_assists = s.resolve_field_key("m_PlayerDataGlobal.m_iPlayerAssists");
+                    ck_damage = s.resolve_field_key("m_PlayerDataGlobal.m_iHeroDamage");
+                    ck_healing = s.resolve_field_key("m_PlayerDataGlobal.m_iHeroHealing");
+                    ck_objective_damage =
+                        s.resolve_field_key("m_PlayerDataGlobal.m_iObjectiveDamage");
                     // Effective max health. The pawn's m_iMaxHealth is a base/
                     // stale value (current health exceeds it ~55% of ticks); the
                     // controller's m_iHealthMax already folds in level growth,
                     // items and buffs, so it's the correct denominator.
-                    ck_health_max =
-                        s.resolve_field_key("m_PlayerDataGlobal.m_iHealthMax");
+                    ck_health_max = s.resolve_field_key("m_PlayerDataGlobal.m_iHealthMax");
                     for i in 0..20usize {
                         let vt = s.resolve_field_key(&format!(
                             "m_PlayerDataGlobal.m_vecStatViewerModifierValues.{i}.m_eValType"
@@ -936,7 +1057,7 @@ impl DemoParser {
                         ));
                         ck_stat_keys.push((vt, val));
                     }
-                    for i in 0..8usize {
+                    for i in 0..SIGNATURE_ABILITY_SLOTS {
                         let item = s.resolve_field_key(&format!(
                             "m_PlayerDataGlobal.m_vecAbilityUpgradeState.{i:04}.m_ItemID"
                         ));
@@ -954,13 +1075,39 @@ impl DemoParser {
 
                 // Maintain slot → hero_id mapping (controller entity index −1).
                 if ctrl_keys_resolved {
-                    for (&idx, entity) in ctx.entities.iter() {
-                        if entity.class_name != CONTROLLER_CLASS {
+                    for &idx in ctx.entities().updated_indices() {
+                        let Some(entity) = ctx.entities().get(idx) else {
+                            continue;
+                        };
+                        if entity.class_name.as_ref() != CONTROLLER_CLASS {
                             continue;
                         }
                         let hero_id = get_i64(entity, ck_hero);
                         if hero_id != 0 {
                             slot_to_hero.insert(idx - 1, hero_id);
+                        }
+                        let team = get_i64(entity, ck_team) as i32;
+                        let name = get_string(entity, ck_name);
+                        let rank = get_i64(entity, ck_rank);
+                        let entry = roster.entry(idx).or_insert_with(|| PlayerInfo {
+                            name: String::new(),
+                            hero_id: 0,
+                            hero_name: String::new(),
+                            team: 0,
+                            rank: 0,
+                        });
+                        if !name.is_empty() {
+                            entry.name = name;
+                        }
+                        if hero_id > 0 && entry.hero_id != hero_id {
+                            entry.hero_id = hero_id;
+                            entry.hero_name = boon::hero_name(hero_id).to_string();
+                        }
+                        if team != 0 {
+                            entry.team = team;
+                        }
+                        if rank > 0 {
+                            entry.rank = rank;
                         }
                     }
                 }
@@ -970,18 +1117,17 @@ impl DemoParser {
                 // the parse via slot_to_hero / pawn_to_hero.
                 {
                     use boon_proto::proto::{
-                        CCitadelUserMessageImportantAbilityUsed,
+                        CCitadelUserMessageGameOver, CCitadelUserMessageImportantAbilityUsed,
                         CCitadelUserMsgAbilitiesChanged, CCitadelUserMsgBossKilled,
-                        CCitadelUserMsgChatMsg, CCitadelUserMsgHeroKilled,
-                        CMsgFireBullets, CitadelUserMessageIds as Msg,
-                        ECitadelGameEvents,
+                        CCitadelUserMsgChatMsg, CCitadelUserMsgHeroKilled, CMsgFireBullets,
+                        CitadelUserMessageIds as Msg, ECitadelGameEvents,
                     };
                     use prost::Message;
                     for event in events {
                         if event.msg_type == Msg::KEUserMsgAbilitiesChanged as u32 {
-                            if let Ok(msg) = CCitadelUserMsgAbilitiesChanged::decode(
-                                event.payload.as_slice(),
-                            ) {
+                            if let Ok(msg) =
+                                CCitadelUserMsgAbilitiesChanged::decode(event.payload.as_slice())
+                            {
                                 item_events_raw.push(RawItemEvent {
                                     tick: event.tick,
                                     player_slot: msg.purchaser_player_slot.unwrap_or(-1),
@@ -990,9 +1136,8 @@ impl DemoParser {
                                 });
                             }
                         } else if event.msg_type == Msg::KEUserMsgHeroKilled as u32
-                            && let Ok(msg) = CCitadelUserMsgHeroKilled::decode(
-                                event.payload.as_slice(),
-                            )
+                            && let Ok(msg) =
+                                CCitadelUserMsgHeroKilled::decode(event.payload.as_slice())
                         {
                             // Prefer scorer (last-hit attribution), fall back to
                             // raw attacker. Self-kills (suicide) come through
@@ -1007,7 +1152,7 @@ impl DemoParser {
                             // Sample the victim pawn's current position so the
                             // map can show a marker at the kill location.
                             let (kx, ky) = ctx
-                                .entities
+                                .entities()
                                 .get(victim)
                                 .map(|e| {
                                     let raw_x = get_f32(e, pk_x);
@@ -1025,18 +1170,20 @@ impl DemoParser {
                                 y: ky,
                             });
                         } else if event.msg_type == Msg::KEUserMsgGameOver as u32
-                            && game_over_tick.is_none()
-                        {
-                            // First GameOver marks the end of regulation play;
-                            // freeze the regulation clock here.
-                            game_over_tick = Some(event.tick);
-                            regulation_ticks = Some(active_ticks);
-                        } else if event.msg_type
-                            == Msg::KEUserMsgImportantAbilityUsed as u32
                             && let Ok(msg) =
-                                CCitadelUserMessageImportantAbilityUsed::decode(
-                                    event.payload.as_slice(),
-                                )
+                                CCitadelUserMessageGameOver::decode(event.payload.as_slice())
+                        {
+                            if game_over_tick.is_none() {
+                                // First GameOver marks the end of regulation play;
+                                // freeze the regulation clock here.
+                                game_over_tick = Some(event.tick);
+                                regulation_ticks = Some(active_ticks);
+                            }
+                            winner = msg.winning_team;
+                        } else if event.msg_type == Msg::KEUserMsgImportantAbilityUsed as u32
+                            && let Ok(msg) = CCitadelUserMessageImportantAbilityUsed::decode(
+                                event.payload.as_slice(),
+                            )
                         {
                             let name = msg.ability_name.unwrap_or_default();
                             if !name.is_empty() {
@@ -1045,23 +1192,20 @@ impl DemoParser {
                                 // after the walk via pawn_to_hero.
                                 ability_events_raw.push(RawAbilityEvent {
                                     tick: event.tick,
-                                    pawn: boon::protobuf_handle_index(msg.player)
-                                        .unwrap_or(-1),
+                                    pawn: boon::protobuf_handle_index(msg.player).unwrap_or(-1),
                                     ability_name: name,
                                 });
                             }
                         } else if event.msg_type == Msg::KEUserMsgBossKilled as u32
-                            && let Ok(msg) = CCitadelUserMsgBossKilled::decode(
-                                event.payload.as_slice(),
-                            )
+                            && let Ok(msg) =
+                                CCitadelUserMsgBossKilled::decode(event.payload.as_slice())
                         {
                             // An objective was destroyed. The killed entity has
                             // usually despawned by now, so label it from the
                             // rolling index→kind cache. entity_position is
                             // already world-space (same frame as kill markers).
                             let killed_idx =
-                                boon::protobuf_handle_index(msg.entity_killed)
-                                    .unwrap_or(-1);
+                                boon::protobuf_handle_index(msg.entity_killed).unwrap_or(-1);
                             let kind = obj_kind_by_idx
                                 .get(&killed_idx)
                                 .copied()
@@ -1070,26 +1214,27 @@ impl DemoParser {
                             // tick). First death wins.
                             obj_death_tick.entry(killed_idx).or_insert(event.tick);
                             let killer_pawn =
-                                boon::protobuf_handle_index(msg.entity_killer)
-                                    .unwrap_or(-1);
+                                boon::protobuf_handle_index(msg.entity_killer).unwrap_or(-1);
                             let (x, y) = msg
                                 .entity_position
-                                .map(|v| {
-                                    (Some(v.x.unwrap_or(0.0)), Some(v.y.unwrap_or(0.0)))
-                                })
+                                .map(|v| (Some(v.x.unwrap_or(0.0)), Some(v.y.unwrap_or(0.0))))
                                 .unwrap_or((None, None));
                             objective_events_raw.push(RawObjectiveEvent {
                                 tick: event.tick,
                                 kind,
+                                action: if kind == "mid_boss" {
+                                    "killed"
+                                } else {
+                                    "destroyed"
+                                },
                                 team: msg.objective_team.unwrap_or(-1),
                                 killer_pawn,
                                 x,
                                 y,
                             });
                         } else if event.msg_type == Msg::KEUserMsgChatMsg as u32
-                            && let Ok(msg) = CCitadelUserMsgChatMsg::decode(
-                                event.payload.as_slice(),
-                            )
+                            && let Ok(msg) =
+                                CCitadelUserMsgChatMsg::decode(event.payload.as_slice())
                         {
                             // Player chat. `player_slot` maps to a hero via
                             // slot_to_hero (same as item purchases); resolved
@@ -1104,10 +1249,8 @@ impl DemoParser {
                                     text,
                                 });
                             }
-                        } else if event.msg_type
-                            == ECitadelGameEvents::GeFireBullets as u32
-                            && let Ok(msg) =
-                                CMsgFireBullets::decode(event.payload.as_slice())
+                        } else if event.msg_type == ECitadelGameEvents::GeFireBullets as u32
+                            && let Ok(msg) = CMsgFireBullets::decode(event.payload.as_slice())
                             && msg.fired_from_gun.unwrap_or(true)
                         {
                             // Gun shots only — abilities also emit FireBullets.
@@ -1129,55 +1272,110 @@ impl DemoParser {
                 // index → serial map: a removal is either an explicit
                 // `entry_type == 2` or a slot reused by a new serial — both
                 // are changes to that index, so both are caught here.
-                if let Some(table) = ctx.string_tables.find_table("ActiveModifiers") {
+                if let Some(table) = ctx.string_tables().find_table("ActiveModifiers") {
                     use prost::Message;
                     for &idx in table.dirty_indices() {
-                        let Some(entry) = table.entries.get(idx) else {
+                        let Some(entry) = table.entries().get(idx) else {
                             continue;
                         };
-                        let Some(data) =
-                            entry.user_data.as_ref().filter(|d| !d.is_empty())
+                        let Some(data) = entry.user_data.as_ref().filter(|d| !d.is_empty()) else {
+                            continue;
+                        };
+                        let Ok(m) = boon_proto::proto::CModifierTableEntry::decode(data.as_slice())
                         else {
                             continue;
                         };
-                        let Ok(m) = boon_proto::proto::CModifierTableEntry::decode(
-                            data.as_slice(),
-                        ) else {
+                        let Some(serial) = m.serial_number else {
                             continue;
                         };
-                        let Some(serial) = m.serial_number else { continue };
 
                         // Slot reused by a different serial → the old modifier
                         // left without an explicit removal entry.
                         if let Some(old) = mod_idx_serial.get(&idx).copied()
                             && old != serial
-                            && let Some(open) = mod_open.remove(&old)
                         {
-                            modifier_spans.push(open.into_span(Some(ctx.tick)));
+                            if let Some(pawn) = barrier_serial_pawn.remove(&old) {
+                                barrier_by_pawn.remove(&pawn);
+                            }
+                            if let Some(open) = mod_open.remove(&old) {
+                                modifier_spans.push(open.into_span(Some(ctx.tick())));
+                            }
                         }
 
                         // Explicit removal (MODIFIER_ENTRY_TYPE_REMOVED == 2).
                         if m.entry_type == Some(2) {
                             mod_idx_serial.remove(&idx);
                             if let Some(open) = mod_open.remove(&serial) {
-                                modifier_spans
-                                    .push(open.into_span(Some(ctx.tick)));
+                                modifier_spans.push(open.into_span(Some(ctx.tick())));
+                            }
+                            if let Some(pawn) = barrier_serial_pawn.remove(&serial) {
+                                barrier_by_pawn.remove(&pawn);
                             }
                             continue;
                         }
 
                         mod_idx_serial.insert(idx, serial);
 
-                        // Open a span only the first time we see this serial;
-                        // later updates (e.g. stack changes) keep apply-time
-                        // values, matching boon-python.
-                        if mod_open.contains_key(&serial) {
+                        if m.modifier_subclass == Some(BARRIER_TRACKER_MODIFIER_ID)
+                            && let Some(parent_idx) = boon::protobuf_handle_index(m.parent)
+                        {
+                            let remaining = m
+                                .float2
+                                .or_else(|| barrier_by_pawn.get(&parent_idx).copied())
+                                .unwrap_or(0.0);
+                            barrier_by_pawn.insert(
+                                parent_idx,
+                                if remaining.is_finite() {
+                                    remaining.max(0.0)
+                                } else {
+                                    0.0
+                                },
+                            );
+                            if let Some(old_pawn) = barrier_serial_pawn.insert(serial, parent_idx)
+                                && old_pawn != parent_idx
+                            {
+                                barrier_by_pawn.remove(&old_pawn);
+                            }
+                        }
+
+                        // A live serial can be resent when the effect is
+                        // refreshed, its duration changes, or its stack count
+                        // moves. Preserve the value visible at each sampled
+                        // frame, but coalesce further updates before the next
+                        // frame; the browser cannot seek between those ticks
+                        // and one object per raw update would waste memory.
+                        // Indefinite modifiers ignore last_applied_time entirely
+                        // (zip-line updates it nearly every tick).
+                        if let Some(mut open) = mod_open.remove(&serial) {
+                            let next_stacks = m.stack_count.unwrap_or(open.stacks);
+                            let next_duration = m.duration.unwrap_or(open.duration);
+                            let next_last_applied =
+                                m.last_applied_time.unwrap_or(open.last_applied_time);
+                            let reapplied = next_duration > 0.0
+                                && next_last_applied.to_bits() != open.last_applied_time.to_bits();
+                            let changed = reapplied
+                                || next_duration.to_bits() != open.duration.to_bits()
+                                || next_stacks != open.stacks;
+
+                            if changed {
+                                let visible_at_a_frame =
+                                    last_emitted.is_some_and(|tick| open.start_tick <= tick);
+                                if visible_at_a_frame {
+                                    modifier_spans.push(open.clone().into_span(Some(ctx.tick())));
+                                    open.start_tick = ctx.tick();
+                                }
+                                if reapplied {
+                                    open.applied_reg_tick = active_ticks;
+                                }
+                                open.last_applied_time = next_last_applied;
+                                open.duration = next_duration;
+                                open.stacks = next_stacks;
+                            }
+                            mod_open.insert(serial, open);
                             continue;
                         }
 
-                        let Some(parent_idx) =
-                            boon::protobuf_handle_index(m.parent)
-                        else {
+                        let Some(parent_idx) = boon::protobuf_handle_index(m.parent) else {
                             continue;
                         };
                         let Some(&hero_id) = pawn_to_hero.get(&parent_idx) else {
@@ -1217,7 +1415,9 @@ impl DemoParser {
                                 caster_hero_id,
                                 stacks: m.stack_count.unwrap_or(0),
                                 duration: m.duration.unwrap_or(-1.0),
-                                start_tick: ctx.tick,
+                                start_tick: ctx.tick(),
+                                applied_reg_tick: active_ticks,
+                                last_applied_time: m.last_applied_time.unwrap_or(-1.0),
                             },
                         );
                     }
@@ -1228,15 +1428,15 @@ impl DemoParser {
                 // row when an ability's cooldown/charge fields differ from last
                 // seen. Mirrors boon-python's `ability_ticks`. Runs every tick
                 // (not the sampled cadence) so a cast's exact tick is captured.
-                for &idx in ctx.entities.updated_indices() {
-                    let Some(entity) = ctx.entities.get(idx) else {
+                for &idx in ctx.entities().updated_indices() {
+                    let Some(entity) = ctx.entities().get(idx) else {
                         continue;
                     };
                     if !entity.class_name.contains("Ability") {
                         continue;
                     }
-                    if !ability_keys_cache.contains_key(&entity.class_name) {
-                        let s = ctx.serializers.get(&entity.class_name);
+                    if !ability_keys_cache.contains_key(entity.class_name.as_ref()) {
+                        let s = ctx.serializers().get(entity.class_name.as_ref());
                         let r = |p: &str| s.and_then(|s| s.resolve_field_key(p));
                         let ak = AbilityKeys {
                             subclass_id: r("m_nSubclassID"),
@@ -1248,14 +1448,12 @@ impl DemoParser {
                             recharge_end: r("m_flChargeRechargeEnd"),
                             owner: r("m_hOwnerEntity"),
                         };
-                        ability_keys_cache.insert(entity.class_name.clone(), ak);
+                        ability_keys_cache.insert(entity.class_name.to_string(), ak);
                     }
-                    let keys = &ability_keys_cache[&entity.class_name];
+                    let keys = &ability_keys_cache[entity.class_name.as_ref()];
                     // Real abilities expose cooldown + charges; other "Ability"
                     // classes (bare bases etc.) don't — skip them.
-                    if keys.cooldown_end.is_none()
-                        || keys.remaining_charges.is_none()
-                    {
+                    if keys.cooldown_end.is_none() || keys.remaining_charges.is_none() {
                         continue;
                     }
                     let hero_id = entity
@@ -1273,11 +1471,10 @@ impl DemoParser {
                         get_f32(entity, keys.recharge_start),
                         get_f32(entity, keys.recharge_end),
                     );
-                    let changed =
-                        abil_prev.get(&idx).map(|p| *p != state).unwrap_or(true);
+                    let changed = abil_prev.get(&idx).map(|p| *p != state).unwrap_or(true);
                     if changed {
                         ability_ticks.push(AbilityTick {
-                            tick: ctx.tick,
+                            tick: ctx.tick(),
                             hero_id,
                             ability_id: get_i64(entity, keys.subclass_id) as u32,
                             slot: get_i64(entity, keys.slot) as i32,
@@ -1292,22 +1489,22 @@ impl DemoParser {
                 }
 
                 if let Some(last) = last_emitted
-                    && ctx.tick - last < step
+                    && ctx.tick() - last < step
                 {
                     return;
                 }
 
                 // --- Live objective roster + sparse health (sampled cadence) ---
-                for (&idx, entity) in ctx.entities.iter() {
+                for (idx, entity) in ctx.entities().iter() {
                     let Some(class) = OBJ_CLASSES
                         .iter()
                         .copied()
-                        .find(|c| *c == entity.class_name.as_str())
+                        .find(|c| *c == entity.class_name.as_ref())
                     else {
                         continue;
                     };
                     if !obj_keys.contains_key(class) {
-                        if let Some(s) = ctx.serializers.get(class) {
+                        if let Some(s) = ctx.serializers().get(class) {
                             obj_keys.insert(class, resolve_obj_keys(s));
                         } else {
                             continue;
@@ -1328,15 +1525,14 @@ impl DemoParser {
                         x: wx,
                         y: wy,
                         max_health,
-                        spawn_tick: ctx.tick,
+                        spawn_tick: ctx.tick(),
                     });
 
                     // Sparse health: record only when (health, max) changes.
-                    if max_health > 0 && obj_last_hp.get(&idx) != Some(&(health, max_health))
-                    {
+                    if max_health > 0 && obj_last_hp.get(&idx) != Some(&(health, max_health)) {
                         obj_last_hp.insert(idx, (health, max_health));
                         obj_health_events.push(ObjectiveHealthEvent {
-                            tick: ctx.tick,
+                            tick: ctx.tick(),
                             id: idx,
                             health,
                             max_health,
@@ -1345,9 +1541,7 @@ impl DemoParser {
                 }
 
                 // --- Neutral camps (sampled cadence) ---
-                if !neutral_keys_resolved
-                    && let Some(s) = ctx.serializers.get(NEUTRAL_CLASS)
-                {
+                if !neutral_keys_resolved && let Some(s) = ctx.serializers().get(NEUTRAL_CLASS) {
                     let o = "CBodyComponent.m_skeletonInstance.m_vecOrigin";
                     nk_cell_x = s.resolve_field_key(&format!("{o}.m_cellX"));
                     nk_vec_x = s.resolve_field_key(&format!("{o}.m_vecX"));
@@ -1360,18 +1554,12 @@ impl DemoParser {
                 if neutral_keys_resolved {
                     // Gather this tick's neutral creeps once.
                     let mut neutrals: Vec<(i32, f32, f32, bool, u8)> = Vec::new();
-                    for (&idx, e) in ctx.entities.iter() {
-                        if e.class_name != NEUTRAL_CLASS {
+                    for (idx, e) in ctx.entities().iter() {
+                        if e.class_name.as_ref() != NEUTRAL_CLASS {
                             continue;
                         }
-                        let x = cell_to_world(
-                            get_i64(e, nk_cell_x) as i32,
-                            get_f32(e, nk_vec_x),
-                        );
-                        let y = cell_to_world(
-                            get_i64(e, nk_cell_y) as i32,
-                            get_f32(e, nk_vec_y),
-                        );
+                        let x = cell_to_world(get_i64(e, nk_cell_x) as i32, get_f32(e, nk_vec_x));
+                        let y = cell_to_world(get_i64(e, nk_cell_y) as i32, get_f32(e, nk_vec_y));
                         let alive = get_i64(e, nk_life) == 0;
                         let tier = neutral_tier(get_i64(e, nk_max_health) as i32);
                         neutrals.push((idx, x, y, alive, tier));
@@ -1420,7 +1608,7 @@ impl DemoParser {
                         if occupied[i] != c.up {
                             c.up = occupied[i];
                             camp_state_events.push(CampStateEvent {
-                                tick: ctx.tick,
+                                tick: ctx.tick(),
                                 camp_id: i as u32,
                                 up: occupied[i],
                             });
@@ -1431,8 +1619,8 @@ impl DemoParser {
                 // Build a hero_id → controller_stats map for this tick.
                 let mut stats_by_hero: HashMap<i64, PlayerStats> = HashMap::new();
                 if ctrl_keys_resolved {
-                    for (_, entity) in ctx.entities.iter() {
-                        if entity.class_name != CONTROLLER_CLASS {
+                    for (_, entity) in ctx.entities().iter() {
+                        if entity.class_name.as_ref() != CONTROLLER_CLASS {
                             continue;
                         }
                         let hero_id = get_i64(entity, ck_hero);
@@ -1479,8 +1667,7 @@ impl DemoParser {
                                 assists: get_i64(entity, ck_assists) as i32,
                                 hero_damage: get_i64(entity, ck_damage) as i32,
                                 hero_healing: get_i64(entity, ck_healing) as i32,
-                                objective_damage: get_i64(entity, ck_objective_damage)
-                                    as i32,
+                                objective_damage: get_i64(entity, ck_objective_damage) as i32,
                                 health_max: get_i64(entity, ck_health_max) as i32,
                                 bonus_health,
                                 spirit_power,
@@ -1498,17 +1685,14 @@ impl DemoParser {
                         // to 3). We capture the constant per-hero ability set
                         // once and log only level *increases* as events.
                         let mut slots: Vec<AbilitySlot> = Vec::new();
-                        for (slot_idx, (item_key, bits_key)) in
-                            ck_ability_keys.iter().enumerate()
-                        {
+                        for (slot_idx, (item_key, bits_key)) in ck_ability_keys.iter().enumerate() {
                             let ability_id = get_i64(entity, *item_key) as u32;
                             if ability_id == 0 {
                                 continue;
                             }
                             slots.push(AbilitySlot {
                                 ability_id,
-                                ability_name: boon::ability_name(ability_id)
-                                    .to_string(),
+                                ability_name: boon::ability_name(ability_id).to_string(),
                             });
                             let raw = get_i64(entity, *bits_key);
                             let level = ((raw >> 17) as i32).count_ones() as i32;
@@ -1517,22 +1701,22 @@ impl DemoParser {
                                 .copied()
                                 .unwrap_or(0);
                             if level > prev {
-                                ability_prev_level
-                                    .insert((hero_id, slot_idx), level);
+                                ability_prev_level.insert((hero_id, slot_idx), level);
                                 ability_upgrade_events.push(AbilityUpgradeEvent {
-                                    tick: ctx.tick,
+                                    tick: ctx.tick(),
                                     hero_id,
                                     ability_id,
                                     level,
                                 });
                             }
                         }
-                        // Keep the fullest ability set seen (slots populate over
-                        // the first few frames; this converges without churn).
-                        let better = ability_slots
-                            .get(&hero_id)
-                            .map(|cur| slots.len() > cur.len())
-                            .unwrap_or(true);
+                        // Slots and hero ID do not update atomically during hero
+                        // initialization. Accept a different equal-length set so
+                        // a transient previous-hero set cannot become permanent.
+                        let better = should_replace_ability_slots(
+                            ability_slots.get(&hero_id).map(Vec::as_slice),
+                            &slots,
+                        );
                         if better && !slots.is_empty() {
                             ability_slots.insert(hero_id, slots);
                         }
@@ -1540,8 +1724,8 @@ impl DemoParser {
                 }
 
                 let mut players: Vec<PlayerPosition> = Vec::new();
-                for (&idx, entity) in ctx.entities.iter() {
-                    if entity.class_name != PAWN_CLASS {
+                for (idx, entity) in ctx.entities().iter() {
+                    if entity.class_name.as_ref() != PAWN_CLASS {
                         continue;
                     }
 
@@ -1563,10 +1747,7 @@ impl DemoParser {
                     let cy = get_i64(entity, pk_cell_y) as i32;
                     let cz = get_i64(entity, pk_cell_z) as i32;
 
-                    let stats = stats_by_hero
-                        .get(&hero_id)
-                        .copied()
-                        .unwrap_or_default();
+                    let stats = stats_by_hero.get(&hero_id).copied().unwrap_or_default();
 
                     // Look direction: QAngle is [pitch, yaw, roll] in degrees.
                     let eye = get_qangle(entity, pk_eye);
@@ -1592,6 +1773,7 @@ impl DemoParser {
                         } else {
                             get_i64(entity, pk_max_health) as i32
                         },
+                        barrier: barrier_by_pawn.get(&idx).copied().unwrap_or(0.0),
                         net_worth: stats.net_worth,
                         ap_net_worth: stats.ap_net_worth,
                         kills: stats.kills,
@@ -1614,9 +1796,7 @@ impl DemoParser {
                 }
 
                 // Lane troopers: pack each alive one into the frame.
-                if !trooper_keys_resolved
-                    && let Some(s) = ctx.serializers.get(TROOPER_CLASS)
-                {
+                if !trooper_keys_resolved && let Some(s) = ctx.serializers().get(TROOPER_CLASS) {
                     let o = "CBodyComponent.m_skeletonInstance.m_vecOrigin";
                     tk_cell_x = s.resolve_field_key(&format!("{o}.m_cellX"));
                     tk_vec_x = s.resolve_field_key(&format!("{o}.m_vecX"));
@@ -1628,18 +1808,12 @@ impl DemoParser {
                 }
                 let mut troopers: Vec<i32> = Vec::new();
                 if trooper_keys_resolved {
-                    for (_, e) in ctx.entities.iter() {
-                        if e.class_name != TROOPER_CLASS || get_i64(e, tk_life) != 0 {
+                    for (_, e) in ctx.entities().iter() {
+                        if e.class_name.as_ref() != TROOPER_CLASS || get_i64(e, tk_life) != 0 {
                             continue;
                         }
-                        let x = cell_to_world(
-                            get_i64(e, tk_cell_x) as i32,
-                            get_f32(e, tk_vec_x),
-                        );
-                        let y = cell_to_world(
-                            get_i64(e, tk_cell_y) as i32,
-                            get_f32(e, tk_vec_y),
-                        );
+                        let x = cell_to_world(get_i64(e, tk_cell_x) as i32, get_f32(e, tk_vec_x));
+                        let y = cell_to_world(get_i64(e, tk_cell_y) as i32, get_f32(e, tk_vec_y));
                         troopers.push(pack_trooper(x, y, get_i64(e, tk_team)));
                     }
                 }
@@ -1649,18 +1823,12 @@ impl DemoParser {
                 // handoff). The idol keys are resolved by the spawn-tracking
                 // block above once the first urn appears.
                 let mut urns: Vec<f32> = Vec::new();
-                for (_, e) in ctx.entities.iter() {
-                    if e.class_name != IDOL_CLASS {
+                for (_, e) in ctx.entities().iter() {
+                    if e.class_name.as_ref() != IDOL_CLASS {
                         continue;
                     }
-                    let x = cell_to_world(
-                        get_i64(e, idk_cell_x) as i32,
-                        get_f32(e, idk_vec_x),
-                    );
-                    let y = cell_to_world(
-                        get_i64(e, idk_cell_y) as i32,
-                        get_f32(e, idk_vec_y),
-                    );
+                    let x = cell_to_world(get_i64(e, idk_cell_x) as i32, get_f32(e, idk_vec_x));
+                    let y = cell_to_world(get_i64(e, idk_cell_y) as i32, get_f32(e, idk_vec_y));
                     urns.push(x);
                     urns.push(y);
                 }
@@ -1668,8 +1836,8 @@ impl DemoParser {
                 // carrier so the urn stays visible through the carry.
                 if urns.is_empty()
                     && let Some(cp) = carrier_pawn
-                    && let Some(e) = ctx.entities.get(cp)
-                    && e.class_name == PAWN_CLASS
+                    && let Some(e) = ctx.entities().get(cp)
+                    && e.class_name.as_ref() == PAWN_CLASS
                 {
                     urns.push(cell_to_world(
                         get_i64(e, pk_cell_x) as i32,
@@ -1681,19 +1849,13 @@ impl DemoParser {
                     ));
                 }
 
-                last_emitted = Some(ctx.tick);
-                frames.push(PositionFrame {
-                    tick: ctx.tick,
-                    reg_ticks: active_ticks,
-                    players,
-                    troopers,
-                    urns,
-                });
+                last_emitted = Some(ctx.tick());
+                frames.push(ctx.tick(), active_ticks, players, troopers, urns);
 
                 // Flush this window's gun-shot tallies onto the frame's tick.
                 for (pawn, count) in fire_accum.drain() {
                     fire_events_raw.push(RawFireEvent {
-                        tick: ctx.tick,
+                        tick: ctx.tick(),
                         pawn,
                         count,
                     });
@@ -1755,8 +1917,7 @@ impl DemoParser {
                 Some(h) => h,
                 None => continue,
             };
-            let attacker_hero_id =
-                pawn_to_hero.get(&raw.attacker_pawn).copied().unwrap_or(0);
+            let attacker_hero_id = pawn_to_hero.get(&raw.attacker_pawn).copied().unwrap_or(0);
             kill_events.push(KillEvent {
                 tick: raw.tick,
                 attacker_hero_id,
@@ -1768,8 +1929,7 @@ impl DemoParser {
 
         // Resolve gun-fire tallies (shooter pawn → hero); drop shots from pawns
         // we never mapped (rare, pre-roster). Already tick-ordered by frame.
-        let mut fire_events: Vec<FireEvent> =
-            Vec::with_capacity(fire_events_raw.len());
+        let mut fire_events: Vec<FireEvent> = Vec::with_capacity(fire_events_raw.len());
         for raw in fire_events_raw {
             if let Some(&hero_id) = pawn_to_hero.get(&raw.pawn) {
                 fire_events.push(FireEvent {
@@ -1781,8 +1941,7 @@ impl DemoParser {
         }
 
         // Resolve important-ability-used events to hero IDs via pawn_to_hero.
-        let mut ability_events: Vec<AbilityEvent> =
-            Vec::with_capacity(ability_events_raw.len());
+        let mut ability_events: Vec<AbilityEvent> = Vec::with_capacity(ability_events_raw.len());
         for raw in ability_events_raw {
             let hero_id = match pawn_to_hero.get(&raw.pawn).copied() {
                 Some(h) => h,
@@ -1812,12 +1971,9 @@ impl DemoParser {
         // actives. Built before `ability_slots` is consumed below.
         let signature_abilities: HashSet<(i64, u32)> = ability_slots
             .iter()
-            .flat_map(|(&hero, slots)| {
-                slots.iter().map(move |s| (hero, s.ability_id))
-            })
+            .flat_map(|(&hero, slots)| slots.iter().map(move |s| (hero, s.ability_id)))
             .collect();
-        ability_ticks
-            .retain(|a| signature_abilities.contains(&(a.hero_id, a.ability_id)));
+        ability_ticks.retain(|a| signature_abilities.contains(&(a.hero_id, a.ability_id)));
 
         // Per-hero ability sets, sorted by hero_id for a stable order.
         let mut ability_slots_out: Vec<HeroAbilities> = ability_slots
@@ -1839,6 +1995,7 @@ impl DemoParser {
                 ObjectiveEvent {
                     tick: raw.tick,
                     kind: raw.kind.to_string(),
+                    action: raw.action.to_string(),
                     team: raw.team,
                     killer_hero_id,
                     x: raw.x,
@@ -1874,10 +2031,18 @@ impl DemoParser {
                 size: c.size,
             })
             .collect();
+        let mut players: Vec<PlayerInfo> = roster
+            .into_values()
+            .filter(|player| player.team == 2 || player.team == 3)
+            .collect();
+        players.sort_by_key(|player| (player.team, player.hero_id));
 
         let result = PositionsResult {
+            players,
+            winner,
+            game_mode,
+            match_mode,
             paths: resolved_paths.unwrap_or_default(),
-            frames,
             item_events,
             kill_events,
             fire_events,
@@ -1896,15 +2061,22 @@ impl DemoParser {
             game_over_tick,
             regulation_ticks,
         };
-        serde_wasm_bindgen::to_value(&result)
-            .map_err(|e| JsError::new(&e.to_string()))
+        let value =
+            serde_wasm_bindgen::to_value(&result).map_err(|e| JsError::new(&e.to_string()))?;
+        frames.attach(&value)?;
+        Ok(value)
     }
 }
 
 #[derive(Serialize)]
 struct PositionsResult {
+    players: Vec<PlayerInfo>,
+    winner: Option<i32>,
+    /// `ECitadelGameMode`: 1 = regular 6v6, 4 = Street Brawl.
+    game_mode: i32,
+    /// `ECitadelMatchMode`: 4 = ranked; regular matchmaking is 1.
+    match_mode: i32,
     paths: ResolvedPaths,
-    frames: Vec<PositionFrame>,
     item_events: Vec<ItemEvent>,
     kill_events: Vec<KillEvent>,
     /// Per-frame gun-shot tallies per hero (count > 0 only); `tick` matches a
@@ -2031,6 +2203,7 @@ struct AbilityTick {
 struct RawObjectiveEvent {
     tick: i32,
     kind: &'static str,
+    action: &'static str,
     team: i32,
     killer_pawn: i32,
     x: Option<f32>,
@@ -2054,8 +2227,10 @@ struct ChatEvent {
     text: String,
 }
 
-/// In-flight modifier being tracked while its ActiveModifiers entry is live;
-/// converted to a `ModifierSpan` when it's removed or the recording ends.
+/// In-flight modifier state while its ActiveModifiers serial is live. A serial
+/// can be refreshed in place, so `last_applied_time` detects a new countdown;
+/// `applied_reg_tick` anchors that countdown to non-paused match time.
+#[derive(Clone)]
 struct OpenModifier {
     hero_id: i64,
     ability_id: u32,
@@ -2065,6 +2240,8 @@ struct OpenModifier {
     stacks: i32,
     duration: f32,
     start_tick: i32,
+    applied_reg_tick: i32,
+    last_applied_time: f32,
 }
 
 impl OpenModifier {
@@ -2073,6 +2250,7 @@ impl OpenModifier {
             hero_id: self.hero_id,
             start_tick: self.start_tick,
             end_tick,
+            applied_reg_tick: self.applied_reg_tick,
             ability_id: self.ability_id,
             ability_name: self.ability_name,
             modifier_name: self.modifier_name,
@@ -2083,18 +2261,17 @@ impl OpenModifier {
     }
 }
 
-/// One modifier active on a player over [start_tick, end_tick); `end_tick` is
-/// None if it was still active when the recording ended. Labeled by its source
-/// ability/item (`ability_id` for the icon, `ability_name` — best name
-/// coverage) with the modifier's own resolved `modifier_name` as a secondary
-/// label (either may be empty, but never both). `caster_hero_id` is the
-/// applying hero (0 if none / not a player), `duration` is in seconds (-1 =
-/// indefinite), `stacks` is the count at apply time.
+/// One stable segment of a modifier's lifetime over [start_tick, end_tick).
+/// In-place refresh/stack/duration updates split a serial into adjacent segments
+/// so seeking reconstructs the values at that tick. `applied_reg_tick` is the
+/// most recent application in non-paused ticks and anchors the countdown;
+/// `duration` is seconds (-1 = indefinite).
 #[derive(Serialize)]
 struct ModifierSpan {
     hero_id: i64,
     start_tick: i32,
     end_tick: Option<i32>,
+    applied_reg_tick: i32,
     ability_id: u32,
     ability_name: String,
     modifier_name: String,
@@ -2106,10 +2283,13 @@ struct ModifierSpan {
 /// An objective destruction. `kind` is a stable slug ("guardian", "walker",
 /// "shrine", "base_guardian", "patron", "mid_boss"); `team` is the
 /// losing/owning team (−1/4 for the neutral Mid-Boss). `x`/`y` are world-space.
+/// Rift events use `opened`, `captured`, or `expired`; a capture's team is
+/// the winner, while neutral lifecycle points use -1.
 #[derive(Serialize)]
 struct ObjectiveEvent {
     tick: i32,
     kind: String,
+    action: String,
     team: i32,
     killer_hero_id: i64,
     x: Option<f32>,
@@ -2233,8 +2413,140 @@ struct PlayerInfo {
     hero_id: i64,
     hero_name: String,
     team: i32,
+    /// `tier * 10 + subdivision`; zero means unavailable or unranked.
+    rank: i64,
 }
 
+const PLAYER_I32_STRIDE: usize = 14;
+const PLAYER_F32_STRIDE: usize = 12;
+
+/// Columnar sampled-frame storage. Numeric typed arrays are both much smaller
+/// than nested JavaScript objects and transferable from the worker without a
+/// structured-clone copy.
+struct PackedFrames {
+    frame_ticks: Vec<i32>,
+    frame_reg_ticks: Vec<i32>,
+    player_offsets: Vec<u32>,
+    player_i32: Vec<i32>,
+    player_f32: Vec<f32>,
+    trooper_offsets: Vec<u32>,
+    troopers: Vec<i32>,
+    urn_offsets: Vec<u32>,
+    urns: Vec<f32>,
+}
+
+impl PackedFrames {
+    fn with_capacity(frame_capacity: usize) -> Self {
+        let player_capacity = frame_capacity.saturating_mul(10);
+        let mut player_offsets = Vec::with_capacity(frame_capacity + 1);
+        let mut trooper_offsets = Vec::with_capacity(frame_capacity + 1);
+        let mut urn_offsets = Vec::with_capacity(frame_capacity + 1);
+        player_offsets.push(0);
+        trooper_offsets.push(0);
+        urn_offsets.push(0);
+        Self {
+            frame_ticks: Vec::with_capacity(frame_capacity),
+            frame_reg_ticks: Vec::with_capacity(frame_capacity),
+            player_offsets,
+            player_i32: Vec::with_capacity(player_capacity.saturating_mul(PLAYER_I32_STRIDE)),
+            player_f32: Vec::with_capacity(player_capacity.saturating_mul(PLAYER_F32_STRIDE)),
+            trooper_offsets,
+            troopers: Vec::with_capacity(frame_capacity.saturating_mul(32)),
+            urn_offsets,
+            urns: Vec::with_capacity(frame_capacity.saturating_mul(2)),
+        }
+    }
+
+    fn push(
+        &mut self,
+        tick: i32,
+        reg_ticks: i32,
+        players: Vec<PlayerPosition>,
+        troopers: Vec<i32>,
+        urns: Vec<f32>,
+    ) {
+        self.frame_ticks.push(tick);
+        self.frame_reg_ticks.push(reg_ticks);
+        for player in players {
+            self.player_i32.extend_from_slice(&[
+                player.slot,
+                player.team as i32,
+                player.hero_id as i32,
+                i32::from(player.alive),
+                player.health,
+                player.max_health,
+                player.net_worth,
+                player.ap_net_worth,
+                player.kills,
+                player.deaths,
+                player.assists,
+                player.hero_damage,
+                player.hero_healing,
+                player.objective_damage,
+            ]);
+            self.player_f32.extend_from_slice(&[
+                player.x,
+                player.y,
+                player.z,
+                player.yaw,
+                player.pitch,
+                player.bonus_health,
+                player.spirit_power,
+                player.fire_rate,
+                player.weapon_damage,
+                player.cooldown_reduction,
+                player.ammo,
+                player.barrier,
+            ]);
+        }
+        self.player_offsets
+            .push((self.player_i32.len() / PLAYER_I32_STRIDE) as u32);
+        self.troopers.extend(troopers);
+        self.trooper_offsets.push(self.troopers.len() as u32);
+        self.urns.extend(urns);
+        self.urn_offsets.push(self.urns.len() as u32);
+    }
+
+    fn attach(&self, target: &JsValue) -> Result<(), JsError> {
+        let frame_ticks = js_sys::Int32Array::from(self.frame_ticks.as_slice());
+        set_js_property(target, "frame_ticks", frame_ticks.as_ref())?;
+        let frame_reg_ticks = js_sys::Int32Array::from(self.frame_reg_ticks.as_slice());
+        set_js_property(target, "frame_reg_ticks", frame_reg_ticks.as_ref())?;
+        let player_offsets = js_sys::Uint32Array::from(self.player_offsets.as_slice());
+        set_js_property(target, "player_offsets", player_offsets.as_ref())?;
+        let player_i32 = js_sys::Int32Array::from(self.player_i32.as_slice());
+        set_js_property(target, "player_i32", player_i32.as_ref())?;
+        let player_f32 = js_sys::Float32Array::from(self.player_f32.as_slice());
+        set_js_property(target, "player_f32", player_f32.as_ref())?;
+        set_js_property(
+            target,
+            "player_i32_stride",
+            &JsValue::from_f64(PLAYER_I32_STRIDE as f64),
+        )?;
+        set_js_property(
+            target,
+            "player_f32_stride",
+            &JsValue::from_f64(PLAYER_F32_STRIDE as f64),
+        )?;
+        let trooper_offsets = js_sys::Uint32Array::from(self.trooper_offsets.as_slice());
+        set_js_property(target, "trooper_offsets", trooper_offsets.as_ref())?;
+        let troopers = js_sys::Int32Array::from(self.troopers.as_slice());
+        set_js_property(target, "troopers", troopers.as_ref())?;
+        let urn_offsets = js_sys::Uint32Array::from(self.urn_offsets.as_slice());
+        set_js_property(target, "urn_offsets", urn_offsets.as_ref())?;
+        let urns = js_sys::Float32Array::from(self.urns.as_slice());
+        set_js_property(target, "urns", urns.as_ref())?;
+        Ok(())
+    }
+}
+
+fn set_js_property(target: &JsValue, name: &str, value: &JsValue) -> Result<(), JsError> {
+    js_sys::Reflect::set(target, &JsValue::from_str(name), value)
+        .map(|_| ())
+        .map_err(|_| JsError::new(&format!("failed to set {name}")))
+}
+
+#[allow(dead_code)]
 #[derive(Serialize)]
 struct PositionFrame {
     tick: i32,
@@ -2265,6 +2577,7 @@ struct PlayerPosition {
     pitch: f32,
     health: i32,
     max_health: i32,
+    barrier: f32,
     net_worth: i32,
     ap_net_worth: i32,
     kills: i32,
@@ -2287,6 +2600,21 @@ struct PlayerPosition {
 struct AbilitySlot {
     ability_id: u32,
     ability_name: String,
+}
+
+fn should_replace_ability_slots(
+    current: Option<&[AbilitySlot]>,
+    candidate: &[AbilitySlot],
+) -> bool {
+    let Some(current) = current else {
+        return !candidate.is_empty();
+    };
+    candidate.len() > current.len()
+        || (candidate.len() == current.len()
+            && candidate
+                .iter()
+                .zip(current)
+                .any(|(new, old)| new.ability_id != old.ability_id))
 }
 
 #[derive(Serialize)]
@@ -2357,9 +2685,7 @@ fn get_qangle(e: &boon::Entity, key: Option<u64>) -> Option<[f32; 3]> {
 fn get_string(e: &boon::Entity, key: Option<u64>) -> String {
     key.and_then(|k| e.fields.get(&k))
         .and_then(|v| match v {
-            boon::FieldValue::String(bytes) => {
-                Some(String::from_utf8_lossy(bytes).into_owned())
-            }
+            boon::FieldValue::String(bytes) => Some(String::from_utf8_lossy(bytes).into_owned()),
             _ => None,
         })
         .unwrap_or_default()
@@ -2396,4 +2722,26 @@ fn walk_fields(s: &Serializer, prefix: &str, out: &mut Vec<String>) {
 
 fn to_js_error(e: boon::Error) -> JsError {
     JsError::new(&e.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{AbilitySlot, should_replace_ability_slots};
+
+    fn slots(ids: &[u32]) -> Vec<AbilitySlot> {
+        ids.iter()
+            .map(|&ability_id| AbilitySlot {
+                ability_id,
+                ability_name: String::new(),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn replaces_stale_equal_length_ability_set() {
+        let werewolf = slots(&[1, 2, 3, 4]);
+        let geist = slots(&[5, 6, 7, 8]);
+        assert!(should_replace_ability_slots(Some(&werewolf), &geist));
+        assert!(!should_replace_ability_slots(Some(&geist), &geist));
+    }
 }

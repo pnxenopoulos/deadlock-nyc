@@ -27,15 +27,38 @@ interface BoonModule {
   default: () => Promise<unknown>;
   DemoParser: new (bytes: Uint8Array) => {
     fileHeader(): unknown;
-    players(): unknown;
     playerPositions(
       sampleEvery: number,
       progress: (tick: number, total: number) => void,
     ): unknown;
-    gameWinner(): number | null | undefined;
     summary(): unknown;
     free(): void;
   };
+}
+
+const PACKED_FRAME_KEYS = [
+  "frame_ticks",
+  "frame_reg_ticks",
+  "player_offsets",
+  "player_i32",
+  "player_f32",
+  "trooper_offsets",
+  "troopers",
+  "urn_offsets",
+  "urns",
+] as const;
+
+function packedFrameTransfers(
+  positions: Record<string, unknown>,
+): ArrayBuffer[] {
+  const buffers = new Set<ArrayBuffer>();
+  for (const key of PACKED_FRAME_KEYS) {
+    const value = positions[key];
+    if (ArrayBuffer.isView(value) && value.buffer instanceof ArrayBuffer) {
+      buffers.add(value.buffer);
+    }
+  }
+  return [...buffers];
 }
 
 let modulePromise: Promise<BoonModule> | null = null;
@@ -55,12 +78,17 @@ function loadModule(): Promise<BoonModule> {
 }
 
 self.onmessage = async (e: MessageEvent<ParseRequest>) => {
-  const { id, bytes, sampleEvery } = e.data;
+  const { id, sampleEvery } = e.data;
   try {
     const mod = await loadModule();
-    const parser = new mod.DemoParser(new Uint8Array(bytes));
+    let input: Uint8Array | null = new Uint8Array(e.data.bytes);
+    // wasm-bindgen copies the file into WASM synchronously. Drop every
+    // JavaScript reference to the transferred source buffer immediately so it
+    // can be reclaimed while the much longer parse pass is running.
+    e.data.bytes = new ArrayBuffer(0);
+    const parser = new mod.DemoParser(input);
+    input = null;
     const header = parser.fileHeader();
-    const players = parser.players();
     // The WASM parse calls this periodically; forward it to the main thread so
     // it can render a progress bar. Cheap — ~a couple hundred messages total.
     const onProgress = (tick: number, total: number) => {
@@ -71,8 +99,16 @@ self.onmessage = async (e: MessageEvent<ParseRequest>) => {
         total,
       } satisfies ParseResponse);
     };
-    const positions = parser.playerPositions(sampleEvery, onProgress);
-    const winner = parser.gameWinner() ?? null;
+    const positions = parser.playerPositions(
+      sampleEvery,
+      onProgress,
+    ) as Record<string, unknown>;
+    // Roster and winner are collected in the entity/event pass above. Remove
+    // them from the positions payload so they have one owner on the main thread.
+    const players = positions.players;
+    const winner = (positions.winner as number | null | undefined) ?? null;
+    delete positions.players;
+    delete positions.winner;
     // Defensive: a malformed/absent post-match summary must not fail the whole
     // parse (the map/heatmap views don't depend on it).
     let summary: unknown = {
@@ -96,7 +132,12 @@ self.onmessage = async (e: MessageEvent<ParseRequest>) => {
       winner,
       summary,
     };
-    (self as unknown as Worker).postMessage(reply);
+    // Moving the packed columns avoids a second copy of the largest result.
+    // The remaining event/metadata objects are comparatively small.
+    (self as unknown as Worker).postMessage(
+      reply,
+      packedFrameTransfers(positions),
+    );
   } catch (err) {
     const reply: ParseResponse = {
       id,

@@ -1,5 +1,6 @@
 import type { PositionsResult } from "@/components/map-view";
 import type { PlayerInfo } from "@/components/player-roster";
+import { FrameStore, type PackedFrameData } from "./frames";
 import type { ParseRequest, ParseResponse } from "./boon-worker";
 
 /** One post-match snapshot for a player (running totals at a sampled time).
@@ -65,6 +66,41 @@ export interface ParsedDemo {
   summary: MatchSummary;
 }
 
+type PackedPositionsResult = Omit<PositionsResult, "frames"> & PackedFrameData;
+
+function unpackPositions(raw: PackedPositionsResult): PositionsResult {
+  const {
+    frame_ticks,
+    frame_reg_ticks,
+    player_offsets,
+    player_i32,
+    player_f32,
+    player_i32_stride,
+    player_f32_stride,
+    trooper_offsets,
+    troopers,
+    urn_offsets,
+    urns,
+    ...metadata
+  } = raw;
+  return {
+    ...metadata,
+    frames: new FrameStore({
+      frame_ticks,
+      frame_reg_ticks,
+      player_offsets,
+      player_i32,
+      player_f32,
+      player_i32_stride,
+      player_f32_stride,
+      trooper_offsets,
+      troopers,
+      urn_offsets,
+      urns,
+    }),
+  };
+}
+
 let worker: Worker | null = null;
 let nextId = 0;
 const pending = new Map<
@@ -91,18 +127,26 @@ function getWorker(): Worker {
       }
       pending.delete(msg.id);
       if (msg.ok) {
-        p.resolve({
-          header: msg.header,
-          players: msg.players as PlayerInfo[],
-          positions: msg.positions as PositionsResult,
-          winner: msg.winner,
-          summary: msg.summary as MatchSummary,
-        });
+        try {
+          p.resolve({
+            header: msg.header,
+            players: msg.players as PlayerInfo[],
+            positions: unpackPositions(
+              msg.positions as PackedPositionsResult,
+            ),
+            winner: msg.winner,
+            summary: msg.summary as MatchSummary,
+          });
+        } catch (error) {
+          p.reject(
+            error instanceof Error ? error : new Error(String(error)),
+          );
+        }
       } else {
         p.reject(new Error(msg.error));
       }
-      // Parsing is done and the results have been structured-cloned onto the
-      // main thread, so the worker is no longer needed. Its WASM linear memory
+      // Parsing is done and the large numeric columns have been transferred
+      // onto the main thread, so the worker is no longer needed. Its WASM memory
       // holds the whole demo plus parse scratch (often 1 GB+) and never shrinks
       // back — only terminating the worker returns it to the OS. We respawn it
       // lazily on the next parseDemo (re-instantiating the small .wasm is cheap).

@@ -32,7 +32,8 @@ and renders the parsed entities, events, and stats in the browser.
 - **Keyboard shortcuts** — `Space` play/pause, `←` / `→` back/forward, `Esc`
   to close dialogs.
 - **Event feeds** (tabbed) — kills, ability usage, objectives (destructions,
-  Mid-Boss, urn spawns), and team-colored chat. Click any row to seek.
+  Mid-Boss, urn spawns, Rift lifecycle), and team-colored chat. Click any row
+  to seek.
 - **Player detail panel** — collapsible Health, Abilities, Items (framed by
   category with gun / vitality / spirit souls invested), and Bonuses.
 - **Dark / light themes.**
@@ -44,6 +45,19 @@ and renders the parsed entities, events, and stats in the browser.
 - [Bun](https://bun.sh/) (package manager + script runner)
 - [boon](https://github.com/pnxenopoulos/boon) (Rust) compiled to WebAssembly
   with [`wasm-pack`](https://github.com/rustwasm/wasm-pack)
+
+## Performance and memory
+
+The WASM adapter uses boon 0.7 and pbdems2 0.2.2. It requests only the event
+types used by the UI and uses boon's changed-entity indices for roster and
+objective updates instead of rescanning every live entity each tick.
+
+Parsing runs in a disposable Web Worker. The demo buffer and packed result
+columns are transferred rather than cloned, and the worker is terminated after
+the parse so its WASM linear memory is returned to the browser. Sampled frames
+remain in typed arrays; the UI materializes only the current and next playback
+frames, while heatmaps and derived stats scan the compact player columns
+directly.
 
 ## Getting started
 
@@ -92,8 +106,8 @@ public/          static assets (item/hero/minimap images, CNAME)
 
 ## Updating game data
 
-Item icons, hero portraits, display names, and the stat panel are generated from
-Deadlock's game files. After a patch, refresh them with the pipeline documented
+Item icons, hero portraits, rank badges, display names, and the stat panel are
+generated from Deadlock's game files. After a patch, refresh them with the pipeline documented
 in [`scripts/README.md`](scripts/README.md):
 
 ```bash

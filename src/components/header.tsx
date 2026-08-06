@@ -20,7 +20,7 @@ function XIcon() {
 
 export function Header({ onInfoClick }: { onInfoClick: () => void }) {
   const { theme, toggle } = useTheme();
-  const { demoLoaded } = useViewMode();
+  const { demoLoaded, demoMode } = useViewMode();
 
   const iconButton =
     "size-8 text-sidebar-foreground hover:bg-sidebar-accent hover:text-sidebar-accent-foreground";
@@ -28,12 +28,22 @@ export function Header({ onInfoClick }: { onInfoClick: () => void }) {
   return (
     <header className="fixed inset-x-0 top-0 z-50 border-b border-border bg-sidebar text-sidebar-foreground">
       <div className="mx-auto flex h-10 max-w-6xl items-center gap-4 px-4">
-        <a
-          href="/"
-          className="flex-1 text-sm font-medium tracking-tight text-sidebar-foreground hover:opacity-90"
-        >
-          deadlock.nyc
-        </a>
+        <div className="flex flex-1 items-center gap-2">
+          <a
+            href="/"
+            className="text-sm font-medium tracking-tight text-sidebar-foreground hover:opacity-90"
+          >
+            deadlock.nyc
+          </a>
+          {demoMode && (
+            <span
+              className="hidden rounded-full border border-sidebar-foreground/20 px-2 py-0.5 text-[10px] font-semibold tracking-wide text-sidebar-foreground/75 sm:inline-flex"
+              title="Game mode"
+            >
+              {demoMode}
+            </span>
+          )}
+        </div>
 
         {/* View switcher sits dead-center, but only once a demo is loaded. */}
         <div className="flex flex-shrink-0 items-center justify-center">

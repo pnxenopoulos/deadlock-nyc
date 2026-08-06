@@ -1,3 +1,6 @@
+# Demos
+*.dem
+
 # Dependencies
 node_modules
 

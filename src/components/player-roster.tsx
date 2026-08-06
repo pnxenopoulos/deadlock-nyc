@@ -43,6 +43,8 @@ export interface PlayerInfo {
   hero_id: number;
   hero_name: string;
   team: number;
+  /** Packed as tier * 10 + subdivision; 0 means unavailable or unranked. */
+  rank: number;
 }
 
 export interface HeroItems {

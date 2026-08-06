@@ -4,31 +4,37 @@ set -euo pipefail
 # Sync Deadlock game data and regenerate the JSON manifests deadlock-nyc ships.
 #
 # What it does:
-#   1) Sparse-clones SteamDatabase/GameTracking-Deadlock (scripts dir only)
-#   2) Copies abilities.vdata + heroes.vdata into scripts/.vdata/ (gitignored)
+#   1) Sparse-clones SteamTracking/GameTracking-Deadlock
+#   2) Copies abilities.vdata, heroes.vdata, and English localization into
+#      scripts/.vdata/ (gitignored)
 #   3) Runs the bun generators:
 #        - build-item-manifest.ts  -> src/data/item-icons.json
 #        - build-item-names.ts     -> src/data/item-names.json
 #        - build-item-stats.ts     -> src/data/item-stats.json
 #        - build-hero-portraits.ts -> src/data/hero-portraits.json
 #        - build-ability-icons.ts  -> src/data/ability-icons.json
+#        - build-ability-names.ts  -> src/data/ability-names.json
 #
-# This refreshes the *data* (item/hero names + icon paths). It does NOT fetch
-# images or the modifier enum — those require the game install + Source 2 Viewer
-# and are documented as manual steps in scripts/README.md. Display names for
-# heroes/abilities live in the `boon` crate; bump it to refresh those.
+# This refreshes the *data* (localized item/ability names + icon paths). It does
+# NOT fetch images or the modifier enum — those require the game install +
+# Source 2 Viewer and are documented as manual steps in scripts/README.md. Hero
+# identifiers still come from the `boon` crate; bump it to refresh those.
 #
 # Environment:
 #   DEADLOCK_REF=<ref>   optional: branch/tag/commit to pin (recommended, so the
 #                        synced data matches the build your images were extracted
 #                        from and the boon-proto version you parse against).
 
-REPO_URL="https://github.com/SteamDatabase/GameTracking-Deadlock.git"
+REPO_URL="https://github.com/SteamTracking/GameTracking-Deadlock.git"
 VDATA_SUBDIR="game/citadel/pak01_dir/scripts"
 VDATA_FILES=(abilities.vdata heroes.vdata)
-# Item display names live in the localization tree, not the scripts dir.
-LOC_SUBDIR="game/citadel/resource/localization/citadel_gc_mod_names"
-LOC_FILES=(citadel_gc_mod_names_english.txt)
+# Display names live in localization trees, not the scripts dir.
+MOD_LOC_SUBDIR="game/citadel/resource/localization/citadel_gc_mod_names"
+HERO_LOC_SUBDIR="game/citadel/resource/localization/citadel_heroes"
+LOC_SOURCES=(
+  "$MOD_LOC_SUBDIR/citadel_gc_mod_names_english.txt"
+  "$HERO_LOC_SUBDIR/citadel_heroes_english.txt"
+)
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$SCRIPT_DIR/.."
@@ -56,7 +62,7 @@ clone_repo() {
 
   cd "$REPO_DIR"
   git sparse-checkout init --cone >/dev/null 2>&1 || true
-  git sparse-checkout set "$VDATA_SUBDIR" "$LOC_SUBDIR" >/dev/null 2>&1 || true
+  git sparse-checkout set "$VDATA_SUBDIR" "$MOD_LOC_SUBDIR" "$HERO_LOC_SUBDIR" >/dev/null 2>&1 || true
 
   if [[ -n "$DEADLOCK_REF" ]]; then
     git checkout -f "$DEADLOCK_REF" >/dev/null 2>&1 || die "Failed to checkout DEADLOCK_REF=$DEADLOCK_REF"
@@ -73,8 +79,9 @@ copy_vdata() {
     cp -f "$src" "$VDATA_DIR/"
     echo "  copied $file"
   done
-  for file in "${LOC_FILES[@]}"; do
-    local src="$REPO_DIR/$LOC_SUBDIR/$file"
+  for rel in "${LOC_SOURCES[@]}"; do
+    local src="$REPO_DIR/$rel"
+    local file="${rel##*/}"
     [[ -f "$src" ]] || die "Missing localization file upstream: $src"
     cp -f "$src" "$VDATA_DIR/"
     echo "  copied $file"
@@ -89,6 +96,7 @@ generate() {
   VDATA_DIR="$VDATA_DIR" bun run scripts/build-item-stats.ts
   VDATA_DIR="$VDATA_DIR" bun run scripts/build-hero-portraits.ts
   VDATA_DIR="$VDATA_DIR" bun run scripts/build-ability-icons.ts
+  VDATA_DIR="$VDATA_DIR" bun run scripts/build-ability-names.ts
 }
 
 main() {
@@ -98,15 +106,17 @@ main() {
   cat <<'EOF'
 
 Done. Regenerated src/data/item-icons.json, src/data/item-names.json,
-src/data/item-stats.json, src/data/hero-portraits.json and
-src/data/ability-icons.json.
+src/data/item-stats.json, src/data/hero-portraits.json,
+src/data/ability-icons.json and src/data/ability-names.json.
 
 Follow-up steps (these can't be pulled from GameTracking):
   - Images: re-export the panorama image tree with Source 2 Viewer on the
-    Deadlock machine at the same game build into panorama/, then run
-    `bun run images` to optimize the referenced subset into public/ as WebP.
-  - Display names: bump the `boon` crate (its sync-name-tables.sh owns the
-    hero/ability id->name tables), then `bun run wasm`.
+    Deadlock machine at the same game build into panorama/, retaining
+    ranked/badges/rankXX_lg_psd.vtex_c, then run `bun run images` to optimize the referenced
+    subset into public/ as WebP and generate src/data/rank-icons.json.
+  - Name tables: bump the `boon` crate when its hero/ability id->internal-name
+    tables change, then `bun run wasm`. Localized ability labels come from this
+    sync's Valve localization files.
   - Modifiers: verify the stat-type ids in wasm/src/lib.rs against a schema
     dump — see scripts/README.md and scripts/check-modifier-values.ts.
 EOF

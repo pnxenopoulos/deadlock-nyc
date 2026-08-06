@@ -8,6 +8,7 @@ export function DemoInfoDialog({
   open,
   onClose,
   name,
+  mode,
   totalTicks,
   regulationClock,
   winner,
@@ -15,6 +16,7 @@ export function DemoInfoDialog({
   open: boolean;
   onClose: () => void;
   name: string;
+  mode: "Ranked" | "Standard" | "Street Brawl";
   totalTicks: number;
   /** Total regulation time, formatted (e.g. "38:36"), or null if unknown. */
   regulationClock: string | null;
@@ -48,6 +50,9 @@ export function DemoInfoDialog({
         <dl className="mt-4 space-y-2.5 text-sm">
           <Row label="File">
             <span className="break-all font-medium">{name}</span>
+          </Row>
+          <Row label="Game mode">
+            <span className="font-medium">{mode}</span>
           </Row>
           <Row label="Total ticks">
             <span className="font-medium tabular-nums">

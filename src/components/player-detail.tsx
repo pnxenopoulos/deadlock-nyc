@@ -3,6 +3,7 @@ import { ChevronDown, ChevronLeft } from "lucide-react";
 
 import { AbilityIcon, prettifyAbilityName } from "@/components/ability-icon";
 import { ItemIcon, itemDisplayName } from "@/components/item-icon";
+import { RankBadge } from "@/components/rank-badge";
 import type {
   AbilitySlot,
   ModifierSpan,
@@ -241,6 +242,7 @@ export function PlayerDetail({
   modifiers,
   players,
   tick,
+  regTick,
   onBack,
 }: {
   player: PlayerInfo;
@@ -253,6 +255,8 @@ export function PlayerDetail({
   modifiers?: ModifierSpan[];
   players?: PlayerInfo[];
   tick?: number;
+  /** Current non-paused match tick, used by modifier countdowns. */
+  regTick?: number;
   onBack: () => void;
 }) {
   const portrait = heroPortraitUrl(player.hero_id);
@@ -309,6 +313,7 @@ export function PlayerDetail({
             {player.name || "—"}
           </p>
         </div>
+        <RankBadge rank={player.rank} className="size-8" />
         <span
           className="text-xs font-semibold uppercase tracking-wide"
           style={{ color: teamColor }}
@@ -332,6 +337,10 @@ export function PlayerDetail({
         >
           <HealthBar
             health={stats?.health ?? 0}
+            maxHealth={stats?.max_health ?? 0}
+          />
+          <BarrierBar
+            barrier={stats?.barrier ?? 0}
             maxHealth={stats?.max_health ?? 0}
           />
         </CollapsibleSection>
@@ -442,7 +451,7 @@ export function PlayerDetail({
               selfTeam={player.team}
               selfHeroId={player.hero_id}
               players={players}
-              tick={tick ?? 0}
+              regTick={regTick ?? 0}
             />
           </CollapsibleSection>
         )}
@@ -607,6 +616,34 @@ function HealthBar({
   );
 }
 
+function BarrierBar({
+  barrier,
+  maxHealth,
+}: {
+  barrier: number;
+  maxHealth: number;
+}) {
+  const remaining = Number.isFinite(barrier) ? Math.max(0, barrier) : 0;
+  const pct =
+    maxHealth > 0
+      ? Math.max(0, Math.min(1, remaining / maxHealth)) * 100
+      : 0;
+  return (
+    <div className="mt-1.5 space-y-1" title="Current barrier remaining">
+      <div className="flex items-center justify-between text-[10px] font-medium uppercase tracking-wide text-cyan-200/80">
+        <span>Barrier</span>
+        <span className="tabular-nums">{Math.round(remaining)}</span>
+      </div>
+      <div className="h-1.5 w-full overflow-hidden rounded-full bg-cyan-950/60">
+        <div
+          className="h-full rounded-full bg-cyan-300 transition-all"
+          style={{ width: `${pct}%` }}
+        />
+      </div>
+    </div>
+  );
+}
+
 // Three horizontally-stacked segments, `level` of them filled, showing how many
 // upgrade tiers are spent on an ability (0 = unlocked / no tiers, up to 3).
 function LevelBars({ level, color }: { level: number; color: string }) {
@@ -705,13 +742,13 @@ function ModifierList({
   selfTeam,
   selfHeroId,
   players,
-  tick,
+  regTick,
 }: {
   modifiers: ModifierSpan[];
   selfTeam: number;
   selfHeroId: number;
   players?: PlayerInfo[];
-  tick: number;
+  regTick: number;
 }) {
   const heroById = React.useMemo(() => {
     const m = new Map<number, PlayerInfo>();
@@ -728,8 +765,11 @@ function ModifierList({
       const key = `${source}|${m.caster_hero_id}`;
       const remaining =
         m.duration > 0
-          ? Math.max(0, (m.start_tick + m.duration * TICKS_PER_SECOND - tick) /
-              TICKS_PER_SECOND)
+          ? Math.max(
+              0,
+              m.duration -
+                (regTick - m.applied_reg_tick) / TICKS_PER_SECOND,
+            )
           : null;
       const casterTeam = heroById.get(m.caster_hero_id)?.team;
       const incoming =
@@ -770,7 +810,7 @@ function ModifierList({
       if (ar !== br) return ar - br;
       return a.label.localeCompare(b.label);
     });
-  }, [modifiers, heroById, selfTeam, selfHeroId, tick]);
+  }, [modifiers, heroById, selfTeam, selfHeroId, regTick]);
 
   if (rows.length === 0) {
     return (
@@ -827,9 +867,11 @@ function ModifierList({
             </div>
             {r.remaining != null && (
               <span className="flex-shrink-0 text-[10px] tabular-nums text-muted-foreground">
-                {r.remaining >= 10
-                  ? Math.round(r.remaining)
-                  : r.remaining.toFixed(1)}
+                {r.remaining < 0.1
+                  ? "<0.1"
+                  : r.remaining >= 10
+                    ? Math.round(r.remaining)
+                    : r.remaining.toFixed(1)}
                 s
               </span>
             )}

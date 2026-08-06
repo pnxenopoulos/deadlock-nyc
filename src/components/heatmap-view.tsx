@@ -28,6 +28,7 @@ import {
   TooltipTrigger,
 } from "@/components/ui/tooltip";
 import { assetUrl, cn } from "@/lib/utils";
+import type { FrameStore } from "@/wasm/frames";
 
 const TICKS_PER_SECOND = 64;
 // Bins per axis for the density grid (over the 21504² world square).
@@ -90,23 +91,10 @@ function project(x: number, y: number): { left: number; top: number } {
 // Nearest frame to a tick (frames are tick-ordered). Kill/ability events carry
 // no (or only a death) position, so we look up where the hero was nearby.
 function nearestFrame(
-  frames: PositionFrame[],
+  frames: FrameStore,
   tick: number,
 ): PositionFrame | undefined {
-  if (frames.length === 0) return undefined;
-  let lo = 0;
-  let hi = frames.length - 1;
-  while (lo < hi) {
-    const mid = (lo + hi) >> 1;
-    if (frames[mid].tick < tick) lo = mid + 1;
-    else hi = mid;
-  }
-  const after = frames[lo];
-  const before = lo > 0 ? frames[lo - 1] : undefined;
-  if (before && Math.abs(before.tick - tick) <= Math.abs(after.tick - tick)) {
-    return before;
-  }
-  return after;
+  return frames.nearest(tick);
 }
 
 type Marker = {
@@ -215,7 +203,7 @@ export function HeatmapView({
   players: PlayerInfo[];
   killEvents: KillEvent[];
   abilityEvents: AbilityEvent[];
-  frames: PositionFrame[];
+  frames: FrameStore;
   objectives: ObjectiveInfo[];
   objectiveEvents: ObjectiveEvent[];
   modifierSpans: ModifierSpan[];
@@ -245,8 +233,8 @@ export function HeatmapView({
   React.useEffect(() => setHiddenAbilities(new Set()), [singleHero]);
 
   // Match-time bounds (frames are tick-ordered) and the selected window.
-  const minTick = frames[0]?.tick ?? 0;
-  const maxTick = frames[frames.length - 1]?.tick ?? 0;
+  const minTick = frames.tickAt(0) ?? 0;
+  const maxTick = frames.tickAt(frames.length - 1) ?? 0;
   const [range, setRange] = React.useState<[number, number]>([minTick, maxTick]);
   React.useEffect(() => setRange([minTick, maxTick]), [minTick, maxTick]);
   const fullRange = range[0] <= minTick && range[1] >= maxTick;
@@ -393,13 +381,14 @@ export function HeatmapView({
     const mk: Marker[] = [];
     const [lo, hi] = range;
     if (mode === "presence") {
-      for (const f of frames) {
-        if (f.tick < lo || f.tick > hi) continue;
-        for (const p of f.players) {
-          if (!selected.has(p.hero_id) || !p.alive) continue;
-          if (p.z < 0 !== (layer === "tunnels")) continue; // match the layer
+      for (let i = 0; i < frames.length; i++) {
+        const tick = frames.tickAt(i) ?? 0;
+        if (tick < lo || tick > hi) continue;
+        frames.forEachPlayerAt(i, (p) => {
+          if (!selected.has(p.hero_id) || !p.alive) return;
+          if (p.z < 0 !== (layer === "tunnels")) return; // match the layer
           add(p.team, p.x, p.y);
-        }
+        });
       }
     } else if (mode === "deaths") {
       for (const k of killEvents) {
@@ -498,19 +487,20 @@ export function HeatmapView({
     const acc = new Map<number, Acc>();
     for (const p of players)
       acc.set(p.hero_id, { own: 0, mid: 0, enemy: 0, distSum: 0, n: 0, distance: 0 });
-    for (const f of frames) {
-      if (f.tick < lo || f.tick > hi) continue;
-      for (const p of f.players) {
+    for (let i = 0; i < frames.length; i++) {
+      const tick = frames.tickAt(i) ?? 0;
+      if (tick < lo || tick > hi) continue;
+      frames.forEachPlayerAt(i, (p) => {
         const a = acc.get(p.hero_id);
-        if (!a) continue;
+        if (!a) return;
         if (a.prev && a.prev.alive && p.alive) {
           a.distance += Math.hypot(p.x - a.prev.x, p.y - a.prev.y);
         }
         a.prev = { x: p.x, y: p.y, alive: p.alive };
-        if (!p.alive || !hasPatrons) continue;
+        if (!p.alive || !hasPatrons) return;
         const ownP = patrons.get(p.team);
         const enemyP = patrons.get(p.team === 2 ? 3 : 2);
-        if (!ownP || !enemyP) continue;
+        if (!ownP || !enemyP) return;
         const ax = enemyP.x - ownP.x;
         const ay = enemyP.y - ownP.y;
         const len2 = ax * ax + ay * ay || 1;
@@ -523,7 +513,7 @@ export function HeatmapView({
         else a.mid++;
         a.distSum += Math.hypot(p.x - ownP.x, p.y - ownP.y);
         a.n++;
-      }
+      });
     }
     const out = new Map<number, HeroStat>();
     for (const [id, a] of acc) {

@@ -16,6 +16,7 @@ import { TimelineView } from "@/components/timeline-view";
 import { MatrixView } from "@/components/matrix-view";
 import {
   MapView,
+  RIFT_COLOR,
   type AbilityEvent,
   type AbilitySlot,
   type AbilityTick,
@@ -37,7 +38,7 @@ import {
   type ObjectiveState,
   type PauseInterval,
   type PlayerPosition,
-  type PositionFrame,
+  type RiftState,
 } from "@/components/map-view";
 import { PlaybackConfig, SPEED_OPTIONS } from "@/components/playback-config";
 import {
@@ -64,9 +65,11 @@ import {
 } from "@/components/ui/tooltip";
 import { cn } from "@/lib/utils";
 import { parseDemo, type MatchSummary } from "@/wasm/boon";
+import type { FrameStore } from "@/wasm/frames";
 import {
   ViewPlaceholder,
   useViewMode,
+  type DemoMode,
 } from "@/components/view-mode";
 
 const SAMPLE_EVERY_TICKS = 8;
@@ -76,8 +79,14 @@ const KILL_MARKER_TICKS = 10 * TICKS_PER_SECOND; // 10 seconds at 64 t/s = 640
 const STEP_TICKS = 640;
 // Objectives are rare and significant, so their map markers linger longer.
 const OBJECTIVE_MARKER_TICKS = 20 * TICKS_PER_SECOND;
+const RIFT_CAPTURE_FADE_TICKS = 10 * TICKS_PER_SECOND;
 // Gold accent for neutral objectives (Mid-Boss) with no owning team.
 const NEUTRAL_OBJECTIVE_COLOR = "#c9a227";
+
+function demoModeLabel(gameMode: number, matchMode: number): DemoMode {
+  if (gameMode === 4) return "Street Brawl";
+  return matchMode === 4 ? "Ranked" : "Standard";
+}
 
 type State =
   | { kind: "idle" }
@@ -90,7 +99,8 @@ type State =
       kind: "done";
       name: string;
       header: unknown;
-      frames: PositionFrame[];
+      mode: DemoMode;
+      frames: FrameStore;
       itemEvents: ItemEvent[];
       killEvents: KillEvent[];
       fireEvents: FireEvent[];
@@ -115,12 +125,14 @@ type State =
 
 export function UploadZone() {
   const [state, setState] = React.useState<State>({ kind: "idle" });
-  const { setDemoLoaded } = useViewMode();
+  const { setDemoLoaded, setDemoMode } = useViewMode();
+  const loadedMode = state.kind === "done" ? state.mode : null;
 
-  // The header's view switcher only appears once a demo is parsed.
+  // The header's view switcher and mode badge only appear after parsing.
   React.useEffect(() => {
     setDemoLoaded(state.kind === "done");
-  }, [state.kind, setDemoLoaded]);
+    setDemoMode(loadedMode);
+  }, [state.kind, loadedMode, setDemoLoaded, setDemoMode]);
 
   async function handleFile(file: File) {
     setState({ kind: "parsing", name: file.name });
@@ -137,6 +149,10 @@ export function UploadZone() {
         kind: "done",
         name: file.name,
         header: parsed.header,
+        mode: demoModeLabel(
+          parsed.positions.game_mode,
+          parsed.positions.match_mode,
+        ),
         frames: parsed.positions.frames,
         itemEvents: parsed.positions.item_events,
         killEvents: parsed.positions.kill_events,
@@ -170,6 +186,7 @@ export function UploadZone() {
     return (
       <DemoView
         name={state.name}
+        mode={state.mode}
         frames={state.frames}
         itemEvents={state.itemEvents}
         killEvents={state.killEvents}
@@ -319,7 +336,9 @@ function IdleView({
           <p className="font-medium text-foreground">Where do I find a replay?</p>
           <p className="mt-1">
             In Deadlock, open your match history and download the replay you
-            want. It's then saved on your PC under:
+            want.
+            <br />
+            It's then saved on your PC under:
           </p>
           <code className="mt-2 block overflow-x-auto rounded bg-muted px-2 py-1 font-mono text-xs text-foreground">
             C:\Program Files (x86)\Steam\steamapps\common\Deadlock\game\citadel\replays
@@ -344,6 +363,7 @@ function formatClock(totalSeconds: number): string {
 
 function DemoView({
   name,
+  mode,
   frames,
   itemEvents,
   killEvents,
@@ -366,7 +386,8 @@ function DemoView({
   summary,
 }: {
   name: string;
-  frames: PositionFrame[];
+  mode: DemoMode;
+  frames: FrameStore;
   itemEvents: ItemEvent[];
   killEvents: KillEvent[];
   fireEvents: FireEvent[];
@@ -401,7 +422,7 @@ function DemoView({
     null,
   );
   const safeIndex = Math.min(index, Math.max(0, frames.length - 1));
-  const frame = frames[safeIndex];
+  const frame = frames.at(safeIndex);
 
   const { view } = useViewMode();
 
@@ -430,15 +451,15 @@ function DemoView({
   //                   DEPTH = depth / aliveReg (0 = own base, 1 = enemy base).
   const movementPrefix = React.useMemo(() => {
     const n = frames.length;
-    const aliveReg = new Map<number, Float64Array>();
-    const dist = new Map<number, Float64Array>();
-    const enemyReg = new Map<number, Float64Array>();
-    const depth = new Map<number, Float64Array>();
+    const aliveReg = new Map<number, Uint32Array>();
+    const dist = new Map<number, Float32Array>();
+    const enemyReg = new Map<number, Uint32Array>();
+    const depth = new Map<number, Float32Array>();
     for (const p of players) {
-      aliveReg.set(p.hero_id, new Float64Array(n));
-      dist.set(p.hero_id, new Float64Array(n));
-      enemyReg.set(p.hero_id, new Float64Array(n));
-      depth.set(p.hero_id, new Float64Array(n));
+      aliveReg.set(p.hero_id, new Uint32Array(n));
+      dist.set(p.hero_id, new Float32Array(n));
+      enemyReg.set(p.hero_id, new Uint32Array(n));
+      depth.set(p.hero_id, new Float32Array(n));
     }
     // Patron (base) position per team. The midline is their perpendicular
     // bisector, so "enemy half" = closer to the other team's Patron.
@@ -454,11 +475,13 @@ function DemoView({
     const enemyAcc = new Map<number, number>();
     const depthAcc = new Map<number, number>();
     for (let i = 0; i < n; i++) {
-      const f = frames[i];
+      const regTicks = frames.regTicksAt(i) ?? 0;
       const dReg =
-        i === 0 ? 0 : Math.max(0, f.reg_ticks - frames[i - 1].reg_ticks);
-      for (const pl of f.players) {
-        if (!aliveReg.has(pl.hero_id)) continue; // unresolved hero (id 0)
+        i === 0
+          ? 0
+          : Math.max(0, regTicks - (frames.regTicksAt(i - 1) ?? 0));
+      frames.forEachPlayerAt(i, (pl) => {
+        if (!aliveReg.has(pl.hero_id)) return; // unresolved hero (id 0)
         const pv = prev.get(pl.hero_id);
         if (pv) {
           if (pl.alive && dReg > 0) {
@@ -489,7 +512,7 @@ function DemoView({
           }
         }
         prev.set(pl.hero_id, { x: pl.x, y: pl.y, alive: pl.alive });
-      }
+      });
       // Snapshot the running totals for every roster hero (carry forward when
       // a hero is missing from this frame).
       for (const p of players) {
@@ -506,9 +529,9 @@ function DemoView({
   const derivedByHero = React.useMemo(() => {
     const m = new Map<number, DerivedStats>();
     const i = safeIndex;
-    const f = frames[i];
+    const f = frames.at(i);
     const regElapsed =
-      (f?.reg_ticks ?? 0) - (frames[0]?.reg_ticks ?? 0);
+      (f?.reg_ticks ?? 0) - (frames.regTicksAt(0) ?? 0);
     // Elapsed regulation minutes — denominator for the per-minute rates.
     const regMinutes = regElapsed / TICKS_PER_SECOND / 60;
     // Team kill totals at this tick → kill participation (an individual can't
@@ -737,8 +760,8 @@ function DemoView({
     });
   }, [spansByHero, selectedHeroId, frame, itemsByHero]);
 
-  const firstTick = frames[0]?.tick ?? 0;
-  const lastTick = frames[frames.length - 1]?.tick ?? 0;
+  const firstTick = frames.tickAt(0) ?? 0;
+  const lastTick = frames.tickAt(frames.length - 1) ?? 0;
   const totalTicks = Math.max(0, lastTick - firstTick);
   const currentTick = frame ? frame.tick - firstTick : 0;
   const regulationClock =
@@ -775,8 +798,8 @@ function DemoView({
       if (e.tick > tick) break; // events are tick-ordered
       if (tick - e.tick > OBJECTIVE_MARKER_TICKS) continue;
       if (e.x == null || e.y == null) continue;
-      // The urn has a live marker (frame.urns), so skip its transient diamond.
-      if (e.kind === "urn") continue;
+      // The urn and Rift have live markers, so skip their transient diamonds.
+      if (e.kind === "urn" || e.kind === "rift") continue;
       out.push({
         x: e.x,
         y: e.y,
@@ -812,6 +835,55 @@ function DemoView({
     }
     return out;
   }, [objectives, objectiveHealth, frame]);
+
+  // The Rift is not a networked objective entity, so reconstruct its live
+  // window from the sparse lifecycle events instead of storing it per frame.
+  const rift: RiftState | null = React.useMemo(() => {
+    const tick = frame?.tick ?? 0;
+    let live: RiftState | null = null;
+    let capturedTick: number | null = null;
+    let lastX: number | null = null;
+    let lastY: number | null = null;
+    for (const e of objectiveEvents) {
+      if (e.tick > tick) break; // events are tick-ordered
+      if (e.kind !== "rift") continue;
+      if (e.action === "opened") {
+        lastX = e.x;
+        lastY = e.y;
+        live =
+          lastX != null && lastY != null
+            ? { x: lastX, y: lastY, color: RIFT_COLOR, opacity: 1 }
+            : null;
+        capturedTick = null;
+      } else if (e.action === "captured") {
+        const capturedX: number | null = e.x ?? lastX;
+        const capturedY: number | null = e.y ?? lastY;
+        live =
+          capturedX != null && capturedY != null
+            ? {
+                x: capturedX,
+                y: capturedY,
+                color: TEAM_COLORS[e.team] ?? RIFT_COLOR,
+                opacity: 1,
+              }
+            : null;
+        lastX = capturedX;
+        lastY = capturedY;
+        capturedTick = e.tick;
+      } else if (e.action === "expired") {
+        live = null;
+        capturedTick = null;
+        lastX = null;
+        lastY = null;
+      }
+    }
+    if (live && capturedTick != null) {
+      const elapsed = tick - capturedTick;
+      if (elapsed >= RIFT_CAPTURE_FADE_TICKS) return null;
+      live.opacity = 1 - elapsed / RIFT_CAPTURE_FADE_TICKS;
+    }
+    return live;
+  }, [objectiveEvents, frame]);
 
   // Reconstruct each neutral camp's up/down state at the current tick from the
   // sparse transitions (latest event ≤ tick; default down until first spawn).
@@ -855,8 +927,8 @@ function DemoView({
       setPlaying(false);
       return;
     }
-    const cur = frames[safeIndex];
-    const next = frames[safeIndex + 1];
+    const cur = frames.at(safeIndex)!;
+    const next = frames.at(safeIndex + 1)!;
     const ms =
       (((next.tick - cur.tick) / TICKS_PER_SECOND) * 1000) / playbackSpeed;
     const t = window.setTimeout(() => setIndex(safeIndex + 1), Math.max(0, ms));
@@ -879,14 +951,14 @@ function DemoView({
 
   function seekToTick(tick: number) {
     if (frames.length === 0) return;
-    let idx = frames.findIndex((f) => f.tick >= tick);
-    if (idx < 0) idx = frames.length - 1;
+    const idx = frames.indexAtOrAfter(tick);
+    if (idx < 0) return;
     seekManually(idx);
   }
 
   // Jump forward/back by a fixed number of ticks relative to the current frame.
   function seekByTicks(delta: number) {
-    const base = frames[safeIndex]?.tick ?? firstTick;
+    const base = frames.tickAt(safeIndex) ?? firstTick;
     seekToTick(base + delta);
   }
 
@@ -971,6 +1043,7 @@ function DemoView({
             modifiers={activeModifiers}
             players={players}
             tick={frame?.tick ?? 0}
+            regTick={frame?.reg_ticks ?? 0}
             onBack={() => setSelectedHeroId(null)}
           />
         ) : (
@@ -1088,6 +1161,7 @@ function DemoView({
             killMarkers={killMarkers}
             objectiveMarkers={objectiveMarkers}
             objectiveStates={objectiveStates}
+            rift={rift}
             campStates={campStates}
             firing={firing}
             onSelectPlayer={setSelectedHeroId}
@@ -1206,6 +1280,7 @@ function DemoView({
         open={infoOpen}
         onClose={() => setInfoOpen(false)}
         name={name}
+        mode={mode}
         totalTicks={totalTicks}
         regulationClock={regulationClock}
         winner={winner}

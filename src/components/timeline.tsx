@@ -1,11 +1,12 @@
 import * as React from "react";
 
-import type { PauseInterval, PositionFrame } from "@/components/map-view";
+import type { PauseInterval } from "@/components/map-view";
 import { cn } from "@/lib/utils";
+import type { FrameStore } from "@/wasm/frames";
 
 interface TimelineProps {
   index: number;
-  frames: PositionFrame[];
+  frames: FrameStore;
   onSeek: (next: number) => void;
   pauseIntervals?: PauseInterval[];
 }
@@ -28,8 +29,8 @@ export function Timeline({
 
   // Map pause tick-ranges to [left%, width%] along the bar. Frames are sampled
   // at a fixed tick cadence, so tick maps ~linearly onto the scrubber.
-  const firstTick = frames[0]?.tick ?? 0;
-  const lastTick = frames[total - 1]?.tick ?? 0;
+  const firstTick = frames.tickAt(0) ?? 0;
+  const lastTick = frames.tickAt(total - 1) ?? 0;
   const span = lastTick - firstTick;
   const pauseBands = React.useMemo(() => {
     if (span <= 0 || !pauseIntervals) return [];
@@ -64,7 +65,7 @@ export function Timeline({
     const rect = el.getBoundingClientRect();
     const x = Math.min(rect.width, Math.max(0, hoverX - rect.left));
     const idx = frameIndexAtClientX(hoverX);
-    const tick = frames[idx]?.tick ?? 0;
+    const tick = frames.tickAt(idx) ?? 0;
     return { x, tick };
   }, [hoverX, frames, frameIndexAtClientX, total]);
 

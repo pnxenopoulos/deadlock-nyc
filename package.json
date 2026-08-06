@@ -14,6 +14,7 @@
     "item-stats": "bun run scripts/build-item-stats.ts",
     "portraits": "bun run scripts/build-hero-portraits.ts",
     "ability-icons": "bun run scripts/build-ability-icons.ts",
+    "ability-names": "bun run scripts/build-ability-names.ts",
     "images": "bun run scripts/build-images.ts",
     "check-modifiers": "bun run scripts/check-modifier-values.ts"
   },

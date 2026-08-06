@@ -9,6 +9,7 @@ import {
 import { cn } from "@/lib/utils";
 
 export type ViewMode = "map" | "timeline" | "matrix" | "heatmap";
+export type DemoMode = "Ranked" | "Standard" | "Street Brawl";
 
 // The top-level ways to look at a parsed demo.
 const VIEWS: { value: ViewMode; label: string; icon: typeof Map }[] = [
@@ -24,6 +25,9 @@ type ViewModeContextValue = {
   /** True once a demo is parsed — the switcher only shows then. */
   demoLoaded: boolean;
   setDemoLoaded: (loaded: boolean) => void;
+  /** Friendly mode for the loaded demo, or null before parsing. */
+  demoMode: DemoMode | null;
+  setDemoMode: React.Dispatch<React.SetStateAction<DemoMode | null>>;
 };
 
 const ViewModeContext = React.createContext<ViewModeContextValue | null>(null);
@@ -31,10 +35,11 @@ const ViewModeContext = React.createContext<ViewModeContextValue | null>(null);
 export function ViewModeProvider({ children }: { children: React.ReactNode }) {
   const [view, setView] = React.useState<ViewMode>("map");
   const [demoLoaded, setDemoLoaded] = React.useState(false);
+  const [demoMode, setDemoMode] = React.useState<DemoMode | null>(null);
 
   const value = React.useMemo(
-    () => ({ view, setView, demoLoaded, setDemoLoaded }),
-    [view, demoLoaded],
+    () => ({ view, setView, demoLoaded, setDemoLoaded, demoMode, setDemoMode }),
+    [view, demoLoaded, demoMode],
   );
 
   return (
