@@ -1,7 +1,21 @@
+import { readFileSync } from "node:fs";
+import path from "node:path";
+
 import { defineConfig } from "vite";
 import react from "@vitejs/plugin-react";
 import tailwindcss from "@tailwindcss/vite";
-import path from "node:path";
+
+const cargoLock = readFileSync(
+  path.resolve(__dirname, "wasm/Cargo.lock"),
+  "utf8",
+);
+const boonVersion = cargoLock.match(
+  /\[\[package\]\]\s+name = "boon-deadlock"\s+version = "([^"]+)"/,
+)?.[1];
+
+if (!boonVersion) {
+  throw new Error("boon-deadlock version not found in wasm/Cargo.lock");
+}
 
 export default defineConfig({
   // Relative asset paths so the build works both at the GitHub Pages project
@@ -14,6 +28,9 @@ export default defineConfig({
   // worker format is IIFE, which can't code-split — emit ES instead.
   worker: { format: "es" },
   plugins: [react(), tailwindcss()],
+  define: {
+    __BOON_VERSION__: JSON.stringify(boonVersion),
+  },
   resolve: {
     alias: {
       "@": path.resolve(__dirname, "./src"),
