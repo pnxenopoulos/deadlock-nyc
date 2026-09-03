@@ -38,7 +38,7 @@ export function InfoDialog({
               rel="noreferrer"
               className="text-primary underline-offset-4 hover:underline"
             >
-              Boon
+              Boon v{__BOON_VERSION__}
             </a>{" "}
             parser compiled to WebAssembly.
           </p>
