@@ -15,10 +15,9 @@ set -euo pipefail
 #        - build-ability-icons.ts  -> src/data/ability-icons.json
 #        - build-ability-names.ts  -> src/data/ability-names.json
 #
-# This refreshes the *data* (localized item/ability names + icon paths). It does
-# NOT fetch images or the modifier enum — those require the game install +
-# Source 2 Viewer and are documented as manual steps in scripts/README.md. Hero
-# identifiers still come from the `boon` crate; bump it to refresh those.
+# This refreshes the *data* (localized item/ability names + icon paths). Images
+# come from the local game install via `bun run extract-images`. Hero identifiers
+# still come from the `boon` crate; bump it to refresh those.
 #
 # Environment:
 #   DEADLOCK_REF=<ref>   optional: branch/tag/commit to pin (recommended, so the
@@ -110,15 +109,11 @@ src/data/item-stats.json, src/data/hero-portraits.json,
 src/data/ability-icons.json and src/data/ability-names.json.
 
 Follow-up steps (these can't be pulled from GameTracking):
-  - Images: re-export the panorama image tree with Source 2 Viewer on the
-    Deadlock machine at the same game build into panorama/, retaining
-    ranked/badges/rankXX_lg_psd.vtex_c, then run `bun run images` to optimize the referenced
-    subset into public/ as WebP and generate src/data/rank-icons.json.
+  - Images: run `bun run extract-images`, then `bun run images`. On the WSL
+    development machine, `bun run refresh` performs this entire workflow.
   - Name tables: bump the `boon` crate when its hero/ability id->internal-name
     tables change, then `bun run wasm`. Localized ability labels come from this
     sync's Valve localization files.
-  - Modifiers: verify the stat-type ids in wasm/src/lib.rs against a schema
-    dump — see scripts/README.md and scripts/check-modifier-values.ts.
 EOF
 }
 

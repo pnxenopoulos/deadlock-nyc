@@ -1,5 +1,12 @@
 import * as React from "react";
-import { ChevronDown, ChevronLeft } from "lucide-react";
+import {
+  ChevronDown,
+  ChevronLeft,
+  Droplet,
+  HeartPulse,
+  Shield,
+  ShieldHalf,
+} from "lucide-react";
 
 import { AbilityIcon, prettifyAbilityName } from "@/components/ability-icon";
 import { ItemIcon, itemDisplayName } from "@/components/item-icon";
@@ -21,6 +28,10 @@ import {
   TooltipContent,
   TooltipTrigger,
 } from "@/components/ui/tooltip";
+import {
+  collapseModifierRows,
+  type ModifierRow,
+} from "@/lib/modifier-rows";
 import { cn } from "@/lib/utils";
 import itemStats from "@/data/item-stats.json";
 
@@ -158,6 +169,21 @@ const ABILITY_PIXELS = 36;
 // Abilities have three upgrade tiers; we render one segment per tier.
 const ABILITY_TIERS = 3;
 const TICKS_PER_SECOND = 64;
+const STAT_COMPLETE = {
+  bulletResist: 1 << 0,
+  spiritResist: 1 << 1,
+  spiritPower: 1 << 2,
+  fireRate: 1 << 3,
+  weaponDamage: 1 << 4,
+  cooldownReduction: 1 << 5,
+  statusResist: 1 << 6,
+  bulletLifesteal: 1 << 7,
+  spiritLifesteal: 1 << 8,
+} as const;
+
+function isComplete(stats: PlayerPosition | undefined, bit: number): boolean {
+  return stats == null || (stats.stat_complete_mask & bit) !== 0;
+}
 
 /** One reconstructed cooldown period for an ability, in absolute ticks. */
 export type CooldownSpan = {
@@ -522,29 +548,69 @@ export function PlayerDetail({
               icon={WeaponDamageIcon}
               label="Weapon DMG"
               value={stats?.weapon_damage ?? 0}
+              complete={isComplete(stats, STAT_COMPLETE.weaponDamage)}
               percent
             />
             <Bonus
               icon={SpiritIcon}
               label="Spirit"
               value={stats?.spirit_power ?? 0}
+              complete={isComplete(stats, STAT_COMPLETE.spiritPower)}
             />
             <Bonus
               icon={FireRateIcon}
               label="Fire Rate"
               value={stats?.fire_rate ?? 0}
+              complete={isComplete(stats, STAT_COMPLETE.fireRate)}
               percent
             />
             <Bonus
               icon={CooldownIcon}
               label="CDR"
               value={stats?.cooldown_reduction ?? 0}
+              complete={isComplete(stats, STAT_COMPLETE.cooldownReduction)}
               percent
             />
             <Bonus
               icon={AmmoIcon}
               label="Ammo"
               value={stats?.ammo ?? 0}
+              percent
+            />
+            <Bonus
+              icon={Shield}
+              label="Bullet Res"
+              value={stats?.bullet_resist ?? 0}
+              complete={isComplete(stats, STAT_COMPLETE.bulletResist)}
+              percent
+            />
+            <Bonus
+              icon={ShieldHalf}
+              label="Spirit Res"
+              value={stats?.spirit_resist ?? 0}
+              complete={isComplete(stats, STAT_COMPLETE.spiritResist)}
+              percent
+            />
+            <Bonus
+              icon={HeartPulse}
+              label="Status Res"
+              value={stats?.status_resist ?? 0}
+              complete={isComplete(stats, STAT_COMPLETE.statusResist)}
+              tooltip="Status Resistance reduces the duration of negative effects such as stuns, slows, silences, and roots. It does not reduce incoming damage."
+              percent
+            />
+            <Bonus
+              icon={Droplet}
+              label="Bullet Lifesteal"
+              value={stats?.bullet_lifesteal ?? 0}
+              complete={isComplete(stats, STAT_COMPLETE.bulletLifesteal)}
+              percent
+            />
+            <Bonus
+              icon={Droplet}
+              label="Spirit Lifesteal"
+              value={stats?.spirit_lifesteal ?? 0}
+              complete={isComplete(stats, STAT_COMPLETE.spiritLifesteal)}
               percent
             />
           </dl>
@@ -671,19 +737,40 @@ function Bonus({
   label,
   value,
   percent,
+  complete = true,
+  tooltip,
 }: {
   icon: React.ComponentType<{ className?: string }>;
   label: string;
   value: number;
   percent?: boolean;
+  complete?: boolean;
+  tooltip?: string;
 }) {
   return (
-    <div>
+    <div title={complete ? undefined : "Best-effort value; Boon does not have every contributing formula"}>
       <dt className="flex items-center gap-1 text-[10px] uppercase tracking-wide text-muted-foreground">
         <Icon className="size-3" />
-        {label}
+        {tooltip ? (
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <button
+                type="button"
+                className="cursor-help border-b border-dotted border-current leading-none"
+              >
+                {label}
+              </button>
+            </TooltipTrigger>
+            <TooltipContent className="max-w-64 normal-case tracking-normal">
+              {tooltip}
+            </TooltipContent>
+          </Tooltip>
+        ) : (
+          label
+        )}
       </dt>
       <dd className="text-sm font-medium tabular-nums">
+        {!complete && "~"}
         {formatBonus(value)}
         {percent ? "%" : ""}
       </dd>
@@ -700,24 +787,6 @@ function formatBonus(value: number): string {
     abs >= 100 ? Math.round(value) : Math.round(value * 10) / 10;
   return rounded > 0 ? `+${rounded}` : `${rounded}`;
 }
-
-// One displayed modifier, after collapsing the raw spans that share a source
-// and caster into a single row.
-type ModRow = {
-  key: string;
-  abilityId: number;
-  abilityName: string;
-  label: string;
-  isItem: boolean;
-  casterHeroId: number;
-  /** Highest in-game stack count seen, and how many raw spans were grouped. */
-  stacks: number;
-  count: number;
-  /** Seconds left at the current tick; null = indefinite. */
-  remaining: number | null;
-  /** True if applied by a hero on the other team (incoming debuff). */
-  incoming: boolean;
-};
 
 // Reconstruct a readable label + icon hint from a span's source. Items are the
 // `upgrade_*` family (great icon + localized-name coverage); everything else is
@@ -757,61 +826,44 @@ function ModifierList({
   }, [players]);
 
   const rows = React.useMemo(() => {
-    const groups = new Map<string, ModRow>();
-    for (const m of modifiers) {
-      const { label, isItem } = modifierLabel(m);
-      if (!label) continue;
-      const source = m.ability_id || `m:${m.modifier_name}`;
-      const key = `${source}|${m.caster_hero_id}`;
-      const remaining =
-        m.duration > 0
-          ? Math.max(
-              0,
-              m.duration -
-                (regTick - m.applied_reg_tick) / TICKS_PER_SECOND,
-            )
-          : null;
-      const casterTeam = heroById.get(m.caster_hero_id)?.team;
-      const incoming =
-        m.caster_hero_id !== 0 &&
-        m.caster_hero_id !== selfHeroId &&
-        casterTeam != null &&
-        casterTeam !== selfTeam;
-      const cur = groups.get(key);
-      if (cur) {
-        cur.count += 1;
-        cur.stacks = Math.max(cur.stacks, m.stacks);
-        // Indefinite (null) outranks any finite remaining.
-        cur.remaining =
-          cur.remaining == null || remaining == null
-            ? null
-            : Math.max(cur.remaining, remaining);
-      } else {
-        groups.set(key, {
-          key,
-          abilityId: m.ability_id,
-          abilityName: m.ability_name,
+    const serialRows = modifiers
+      .map((modifier): ModifierRow | null => {
+        const { label, isItem } = modifierLabel(modifier);
+        if (!label) return null;
+        const remaining =
+          modifier.duration > 0
+            ? Math.max(
+                0,
+                modifier.duration -
+                  (regTick - modifier.applied_reg_tick) / TICKS_PER_SECOND,
+              )
+            : null;
+        const casterTeam = heroById.get(modifier.caster_hero_id)?.team;
+        return {
+          key: `${modifier.serial}:${modifier.modifier_id}`,
+          abilityId: modifier.ability_id,
+          abilityName: modifier.ability_name,
           label,
           isItem,
-          casterHeroId: m.caster_hero_id,
-          stacks: m.stacks,
-          count: 1,
+          casterHeroId: modifier.caster_hero_id,
+          stacks: modifier.stacks,
           remaining,
-          incoming,
-        });
-      }
-    }
-    // Incoming enemy debuffs first, then by remaining time (timed effects
-    // before passives), then alphabetically for stability.
-    return [...groups.values()].sort((a, b) => {
-      if (a.incoming !== b.incoming) return a.incoming ? -1 : 1;
-      const ar = a.remaining ?? Infinity;
-      const br = b.remaining ?? Infinity;
-      if (ar !== br) return ar - br;
-      return a.label.localeCompare(b.label);
-    });
-  }, [modifiers, heroById, selfTeam, selfHeroId, regTick]);
+          incoming:
+            modifier.caster_hero_id !== 0 &&
+            modifier.caster_hero_id !== selfHeroId &&
+            casterTeam != null &&
+            casterTeam !== selfTeam,
+        };
+      })
+      .filter((row): row is ModifierRow => row != null);
 
+    return collapseModifierRows(serialRows, selfHeroId)
+      .sort((a, b) => {
+        if (a.incoming !== b.incoming) return a.incoming ? -1 : 1;
+        const remaining = (a.remaining ?? Infinity) - (b.remaining ?? Infinity);
+        return remaining || a.label.localeCompare(b.label);
+      });
+  }, [modifiers, heroById, selfTeam, selfHeroId, regTick]);
   if (rows.length === 0) {
     return (
       <p className="text-xs text-muted-foreground">No active modifiers.</p>
@@ -825,7 +877,7 @@ function ModifierList({
           r.casterHeroId && r.casterHeroId !== selfHeroId
             ? heroById.get(r.casterHeroId)
             : undefined;
-        const multiplier = r.stacks > 1 ? r.stacks : r.count > 1 ? r.count : 0;
+        const multiplier = r.stacks > 1 ? r.stacks : 0;
         return (
           <li
             key={r.key}

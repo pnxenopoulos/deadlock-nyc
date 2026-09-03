@@ -71,10 +71,6 @@
     "cat": "spirit",
     "cost": 6400
   },
-  "upgrade_ablative_coat": {
-    "cat": "vitality",
-    "cost": 6400
-  },
   "upgrade_absorbing_armor": {
     "cat": "vitality",
     "cost": 6400
@@ -151,10 +147,6 @@
     "cat": "spirit",
     "cost": 6400
   },
-  "upgrade_armor_reduction_debuff": {
-    "cat": "weapon",
-    "cost": 3200
-  },
   "upgrade_attack_speed_1": {
     "cat": "weapon",
     "cost": 1600
@@ -202,10 +194,6 @@
   "upgrade_bullet_armor": {
     "cat": "vitality",
     "cost": 1600
-  },
-  "upgrade_bullet_armor_2": {
-    "cat": "vitality",
-    "cost": 3200
   },
   "upgrade_bullet_armor_reduction_aura": {
     "cat": "weapon",
@@ -312,10 +300,6 @@
     "cost": 1600
   },
   "upgrade_colossus": {
-    "cat": "vitality",
-    "cost": 6400
-  },
-  "upgrade_combo_breaker": {
     "cat": "vitality",
     "cost": 6400
   },
@@ -545,10 +529,6 @@
   },
   "upgrade_health_stimpak": {
     "cat": "vitality",
-    "cost": 800
-  },
-  "upgrade_height_advantage": {
-    "cat": "weapon",
     "cost": 800
   },
   "upgrade_high_impact_armor": {
@@ -978,10 +958,6 @@
   "upgrade_tech_damage_pulse": {
     "cat": "spirit",
     "cost": 3200
-  },
-  "upgrade_tech_defender": {
-    "cat": "vitality",
-    "cost": 6400
   },
   "upgrade_tech_defense_shredders": {
     "cat": "weapon",

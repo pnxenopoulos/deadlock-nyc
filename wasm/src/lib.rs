@@ -18,6 +18,11 @@ const PAWN_CLASS: &str = "CCitadelPlayerPawn";
 const CONTROLLER_CLASS: &str = "CCitadelPlayerController";
 const GAMERULES_CLASS: &str = "CCitadelGameRulesProxy";
 const BARRIER_TRACKER_MODIFIER_ID: u32 = 4_267_845_006;
+const BREAKABLE_CLASS: &str = "CCitadel_BreakableProp";
+const SINNER_CLASSES: &[&str] = &[
+    "CNPC_Neutral_SinnersSacrifice",
+    "CNPC_Neutral_SinnersSacrifice_Hideout",
+];
 
 /// Networked classes of the destructible objectives, used to label
 /// `k_EUserMsg_BossKilled` events for the objectives feed. The killed entity is
@@ -72,6 +77,8 @@ const URN_CARRY_MAX_TICKS: i32 = 90 * 64;
 /// previous hero's IDs during initialization.
 const SIGNATURE_ABILITY_SLOTS: usize = 4;
 
+const ABILITY_UPGRADE_SLOTS: usize = 8;
+const UPGRADE_SLOTS: usize = 16;
 /// The game clears the Rift location to FLT_MAX when it resolves. This sanity
 /// bound rejects that finite sentinel and any other implausible map coordinate.
 const RIFT_COORD_SANITY: f32 = 1.0e6;
@@ -198,36 +205,6 @@ impl DemoParser {
     pub fn file_header(&self) -> Result<JsValue, JsError> {
         let header = self.inner.file_header().map_err(to_js_error)?;
         serde_wasm_bindgen::to_value(&header).map_err(|e| JsError::new(&e.to_string()))
-    }
-
-    #[wasm_bindgen(js_name = fileInfo)]
-    pub fn file_info(&self) -> Result<JsValue, JsError> {
-        let info = self.inner.file_info().map_err(to_js_error)?;
-        serde_wasm_bindgen::to_value(&info).map_err(|e| JsError::new(&e.to_string()))
-    }
-
-    /// Team number of the match winner, scanned from the
-    /// `k_EUserMsg_GameOver` Citadel user message. Returns `null` if the
-    /// demo doesn't contain one (e.g. it ended before the match did).
-    #[wasm_bindgen(js_name = gameWinner)]
-    pub fn game_winner(&self) -> Result<JsValue, JsError> {
-        use boon_proto::proto::{CCitadelUserMessageGameOver, CitadelUserMessageIds as Msg};
-        use prost::Message;
-
-        let event_types = [Msg::KEUserMsgGameOver as u32].into_iter().collect();
-        let events = self
-            .inner
-            .events_filtered(None, &event_types)
-            .map_err(to_js_error)?;
-        let mut winner: Option<i32> = None;
-        for event in &events {
-            if event.msg_type == Msg::KEUserMsgGameOver as u32
-                && let Ok(msg) = CCitadelUserMessageGameOver::decode(event.payload.as_slice())
-            {
-                winner = msg.winning_team;
-            }
-        }
-        serde_wasm_bindgen::to_value(&winner).map_err(|e| JsError::new(&e.to_string()))
     }
 
     /// Post-match summary from the demo's `PostMatchDetails` user message: the
@@ -403,92 +380,6 @@ impl DemoParser {
         .map_err(|e| JsError::new(&e.to_string()))
     }
 
-    #[wasm_bindgen(js_name = serializerFields)]
-    pub fn serializer_fields(&self, class_name: &str) -> Result<JsValue, JsError> {
-        let ctx = self.inner.parse_init().map_err(to_js_error)?;
-        let serializer = ctx
-            .serializers()
-            .get(class_name)
-            .ok_or_else(|| JsError::new(&format!("class {class_name} not found")))?;
-        let mut paths: Vec<String> = Vec::new();
-        walk_fields(serializer, "", &mut paths);
-        serde_wasm_bindgen::to_value(&paths).map_err(|e| JsError::new(&e.to_string()))
-    }
-
-    /// Roster from CCitadelPlayerController: name, hero, team, and packed rank.
-    /// Hero ID is resolved to a name via boon's lookup table.
-    #[wasm_bindgen(js_name = players)]
-    pub fn players(&self) -> Result<JsValue, JsError> {
-        let class_filter: HashSet<&str> = [CONTROLLER_CLASS].into_iter().collect();
-
-        let mut keys_resolved = false;
-        let mut nk_team: Option<u64> = None;
-        let mut nk_name: Option<u64> = None;
-        let mut nk_hero: Option<u64> = None;
-        let mut nk_rank: Option<u64> = None;
-
-        let mut roster: HashMap<i32, PlayerInfo> = HashMap::new();
-
-        self.inner
-            .run_to_end_filtered(&class_filter, |ctx| {
-                if !keys_resolved {
-                    if let Some(s) = ctx.serializers().get(CONTROLLER_CLASS) {
-                        nk_team = s.resolve_field_key("m_iTeamNum");
-                        nk_name = s.resolve_field_key("m_iszPlayerName");
-                        nk_hero = s.resolve_field_key("m_PlayerDataGlobal.m_nHeroID");
-                        nk_rank = s.resolve_field_key("m_PlayerDataGlobal.m_unPackedRank");
-                        keys_resolved = true;
-                    } else {
-                        return;
-                    }
-                }
-
-                for (idx, entity) in ctx.entities().iter() {
-                    if entity.class_name.as_ref() != CONTROLLER_CLASS {
-                        continue;
-                    }
-
-                    let team = get_i64(entity, nk_team) as i32;
-                    let name = get_string(entity, nk_name);
-                    let hero_id = get_i64(entity, nk_hero);
-                    let rank = get_i64(entity, nk_rank);
-                    let hero_name = if hero_id > 0 {
-                        boon::hero_name(hero_id).to_string()
-                    } else {
-                        String::new()
-                    };
-
-                    let entry = roster.entry(idx).or_insert(PlayerInfo {
-                        name: String::new(),
-                        hero_id: 0,
-                        hero_name: String::new(),
-                        team: 0,
-                        rank: 0,
-                    });
-                    if !name.is_empty() {
-                        entry.name = name;
-                    }
-                    if hero_id > 0 {
-                        entry.hero_id = hero_id;
-                        entry.hero_name = hero_name;
-                    }
-                    if team != 0 {
-                        entry.team = team;
-                    }
-                    if rank > 0 {
-                        entry.rank = rank;
-                    }
-                }
-            })
-            .map_err(to_js_error)?;
-
-        let players: Vec<PlayerInfo> = roster
-            .into_values()
-            .filter(|p| p.team == 2 || p.team == 3)
-            .collect();
-        serde_wasm_bindgen::to_value(&players).map_err(|e| JsError::new(&e.to_string()))
-    }
-
     /// Walk every tick and emit per-player frames sampled every
     /// `sample_every` ticks. Each frame contains both the position from
     /// CCitadelPlayerPawn and the live stats from CCitadelPlayerController,
@@ -526,9 +417,11 @@ impl DemoParser {
             NEUTRAL_CLASS,
             TROOPER_CLASS,
             IDOL_CLASS,
+            BREAKABLE_CLASS,
         ]
         .into_iter()
         .chain(OBJ_CLASSES.iter().copied())
+        .chain(SINNER_CLASSES.iter().copied())
         .chain(ability_class_names.iter().map(String::as_str))
         .collect();
 
@@ -578,13 +471,17 @@ impl DemoParser {
         let mut ck_healing: Option<u64> = None;
         let mut ck_objective_damage: Option<u64> = None;
         let mut ck_health_max: Option<u64> = None;
+        let mut ck_pawn: Option<u64> = None;
         // (eValType key, value key) pairs for the 20 stat-modifier slots on
         // m_PlayerDataGlobal.m_vecStatViewerModifierValues.
         let mut ck_stat_keys: Vec<(Option<u64>, Option<u64>)> = Vec::with_capacity(20);
+        let mut ck_level: Option<u64> = None;
+        let mut ck_upgrade_count: Option<u64> = None;
+        let mut ck_upgrade_keys = [None; UPGRADE_SLOTS];
         // (m_ItemID key, m_nUpgradeInfo key) pairs for the four signature slots
         // on m_PlayerDataGlobal.m_vecAbilityUpgradeState.
         let mut ck_ability_keys: Vec<(Option<u64>, Option<u64>)> =
-            Vec::with_capacity(SIGNATURE_ABILITY_SLOTS);
+            Vec::with_capacity(ABILITY_UPGRADE_SLOTS);
 
         let frame_capacity = (total_ticks.max(0) as usize / step as usize).saturating_add(1);
         let mut frames = PackedFrames::with_capacity(frame_capacity);
@@ -602,7 +499,6 @@ impl DemoParser {
         // the walk, like kills). Powers the live-map muzzle pulses.
         let mut fire_accum: HashMap<i32, u16> = HashMap::new();
         let mut fire_events_raw: Vec<RawFireEvent> = Vec::new();
-        let mut resolved_paths: Option<ResolvedPaths> = None;
 
         // Objective destructions (Guardian/Walker/Shrine/Base Guardian/Patron +
         // Mid-Boss). Resolved post-loop to hero IDs via pawn_to_hero. The
@@ -622,6 +518,15 @@ impl DemoParser {
         let mut obj_last_hp: HashMap<i32, (i32, i32)> = HashMap::new();
         let mut obj_health_events: Vec<ObjectiveHealthEvent> = Vec::new();
         let mut obj_death_tick: HashMap<i32, i32> = HashMap::new();
+
+        // Stable entity identities keep PVS leaves and slot reuse from being
+        // mistaken for destruction or a fresh spawn.
+        let mut breakable_keys: Option<MapEntityKeys> = None;
+        let mut breakable_live: HashMap<boon::EntityId, BreakableState> = HashMap::new();
+        let mut breakable_pending: HashMap<boon::EntityId, (i32, BreakableState)> = HashMap::new();
+        let mut sinner_keys: Option<MapEntityKeys> = None;
+        let mut sinner_health: HashMap<boon::EntityId, i32> = HashMap::new();
+        let mut sinner_events: Vec<SinnerEvent> = Vec::new();
 
         // Neutral camps. No camp entity exists, so camps are clustered from
         // creep spawn positions (first-seen ≈ at-rest at the camp). Size is the
@@ -708,7 +613,7 @@ impl DemoParser {
         // than the modifier's own subclass) with the modifier's own name as a
         // secondary label; spans that resolve to neither are dropped. Reading
         // the string table is independent of the entity class filter.
-        let mut mod_idx_serial: HashMap<usize, u32> = HashMap::new();
+        let mut modifier_state = boon::ModifierState::default();
         let mut mod_open: HashMap<u32, OpenModifier> = HashMap::new();
         let mut modifier_spans: Vec<ModifierSpan> = Vec::new();
         // Barrier is not a pawn send-table field. Its persistent tracker uses
@@ -924,8 +829,10 @@ impl DemoParser {
                         continue;
                     }
                     idol_now.insert(idx);
-                    let ux = cell_to_world(get_i64(e, idk_cell_x) as i32, get_f32(e, idk_vec_x));
-                    let uy = cell_to_world(get_i64(e, idk_cell_y) as i32, get_f32(e, idk_vec_y));
+                    let ux =
+                        boon::cell_to_world(get_i64(e, idk_cell_x) as i32, get_f32(e, idk_vec_x));
+                    let uy =
+                        boon::cell_to_world(get_i64(e, idk_cell_y) as i32, get_f32(e, idk_vec_y));
                     idol_last_pos.insert(idx, (ux, uy));
                     if !idol_prev.contains(&idx) {
                         if carrier_pawn.is_some() {
@@ -956,8 +863,10 @@ impl DemoParser {
                         if pe.class_name.as_ref() != PAWN_CLASS || get_i64(pe, pk_life) != 0 {
                             continue;
                         }
-                        let x = cell_to_world(get_i64(pe, pk_cell_x) as i32, get_f32(pe, pk_x));
-                        let y = cell_to_world(get_i64(pe, pk_cell_y) as i32, get_f32(pe, pk_y));
+                        let x =
+                            boon::cell_to_world(get_i64(pe, pk_cell_x) as i32, get_f32(pe, pk_x));
+                        let y =
+                            boon::cell_to_world(get_i64(pe, pk_cell_y) as i32, get_f32(pe, pk_y));
                         let d = ((x - lx).powi(2) + (y - ly).powi(2)).sqrt();
                         if d < best.0 {
                             best = (d, pidx);
@@ -982,31 +891,13 @@ impl DemoParser {
                 }
 
                 if !pawn_keys_resolved && let Some(s) = ctx.serializers().get(PAWN_CLASS) {
-                    let mut all_paths: Vec<String> = Vec::new();
-                    walk_fields(s, "", &mut all_paths);
-
-                    let find = |suffix: &str| -> Option<(String, u64)> {
-                        all_paths
-                            .iter()
-                            .find(|p| p == &suffix || p.ends_with(&format!(".{suffix}")))
-                            .and_then(|p| s.resolve_field_key(p).map(|k| (p.clone(), k)))
-                    };
-
-                    let (px, kx) = find("m_vecX").unzip();
-                    let (py, ky) = find("m_vecY").unzip();
-                    // z / cell_z are read per-tick too, to place heroes on the
-                    // surface vs the tunnels layer (see PlayerPosition.z).
-                    let (pz, kz) = find("m_vecZ").unzip();
-                    let (pcx, kcx) = find("m_cellX").unzip();
-                    let (pcy, kcy) = find("m_cellY").unzip();
-                    let (pcz, kcz) = find("m_cellZ").unzip();
-
-                    pk_x = kx;
-                    pk_y = ky;
-                    pk_z = kz;
-                    pk_cell_x = kcx;
-                    pk_cell_y = kcy;
-                    pk_cell_z = kcz;
+                    let origin = "CBodyComponent.m_skeletonInstance.m_vecOrigin";
+                    pk_x = s.resolve_field_key(&format!("{origin}.m_vecX"));
+                    pk_y = s.resolve_field_key(&format!("{origin}.m_vecY"));
+                    pk_z = s.resolve_field_key(&format!("{origin}.m_vecZ"));
+                    pk_cell_x = s.resolve_field_key(&format!("{origin}.m_cellX"));
+                    pk_cell_y = s.resolve_field_key(&format!("{origin}.m_cellY"));
+                    pk_cell_z = s.resolve_field_key(&format!("{origin}.m_cellZ"));
                     pk_team = s.resolve_field_key("m_iTeamNum");
                     pk_hero =
                         s.resolve_field_key("m_CCitadelHeroComponent.m_spawnedHero.m_nHeroID");
@@ -1014,18 +905,6 @@ impl DemoParser {
                     pk_health = s.resolve_field_key("m_iHealth");
                     pk_max_health = s.resolve_field_key("m_iMaxHealth");
                     pk_eye = s.resolve_field_key("m_angEyeAngles");
-
-                    resolved_paths = Some(ResolvedPaths {
-                        vec_x: px,
-                        vec_y: py,
-                        vec_z: pz,
-                        cell_x: pcx,
-                        cell_y: pcy,
-                        cell_z: pcz,
-                        team: pk_team.map(|_| "m_iTeamNum".into()),
-                        life: pk_life.map(|_| "m_lifeState".into()),
-                    });
-
                     pawn_keys_resolved = true;
                 }
 
@@ -1048,6 +927,12 @@ impl DemoParser {
                     // controller's m_iHealthMax already folds in level growth,
                     // items and buffs, so it's the correct denominator.
                     ck_health_max = s.resolve_field_key("m_PlayerDataGlobal.m_iHealthMax");
+                    ck_pawn = s.resolve_field_key("m_hPawn");
+                    ck_level = s.resolve_field_key("m_PlayerDataGlobal.m_iLevel");
+                    ck_upgrade_count = s.resolve_field_key("m_PlayerDataGlobal.m_vecUpgrades");
+                    ck_upgrade_keys = std::array::from_fn(|i| {
+                        s.resolve_field_key(&format!("m_PlayerDataGlobal.m_vecUpgrades.{i}"))
+                    });
                     for i in 0..20usize {
                         let vt = s.resolve_field_key(&format!(
                             "m_PlayerDataGlobal.m_vecStatViewerModifierValues.{i}.m_eValType"
@@ -1057,7 +942,7 @@ impl DemoParser {
                         ));
                         ck_stat_keys.push((vt, val));
                     }
-                    for i in 0..SIGNATURE_ABILITY_SLOTS {
+                    for i in 0..ABILITY_UPGRADE_SLOTS {
                         let item = s.resolve_field_key(&format!(
                             "m_PlayerDataGlobal.m_vecAbilityUpgradeState.{i:04}.m_ItemID"
                         ));
@@ -1073,7 +958,20 @@ impl DemoParser {
                     return;
                 }
 
-                // Maintain slot → hero_id mapping (controller entity index −1).
+                // Keep the pawn-to-hero map current on every entity tick. This
+                // lets modifier applications resolve before the next sampled
+                // frame instead of silently losing short-lived effects.
+                for &idx in ctx.entities().updated_indices() {
+                    let Some(entity) = ctx.entities().get(idx) else {
+                        continue;
+                    };
+                    if entity.class_name.as_ref() == PAWN_CLASS {
+                        let hero_id = get_i64(entity, pk_hero);
+                        if hero_id != 0 {
+                            pawn_to_hero.insert(idx, hero_id);
+                        }
+                    }
+                }
                 if ctrl_keys_resolved {
                     for &idx in ctx.entities().updated_indices() {
                         let Some(entity) = ctx.entities().get(idx) else {
@@ -1108,6 +1006,136 @@ impl DemoParser {
                         }
                         if rank > 0 {
                             entry.rank = rank;
+                        }
+                    }
+                }
+
+                // Breakable props report destruction as a terminal PVS leave.
+                // Keep the candidate until the full demo confirms that the
+                // same stable entity identity never reactivated.
+                if breakable_keys.is_none()
+                    && let Some(serializer) = ctx.serializers().get(BREAKABLE_CLASS)
+                {
+                    breakable_keys = Some(MapEntityKeys::resolve(serializer));
+                }
+                if let Some(keys) = breakable_keys {
+                    let changes = ctx.entities().entity_changes();
+                    for change in changes {
+                        if change.class_name.as_ref() == BREAKABLE_CLASS
+                            && change.kind == boon::EntityChangeKind::Reactivated
+                        {
+                            breakable_pending.remove(&change.id());
+                        }
+                    }
+                    for &idx in ctx.entities().updated_indices() {
+                        let Some(entity) = ctx.entities().get(idx) else {
+                            continue;
+                        };
+                        if entity.class_name.as_ref() != BREAKABLE_CLASS {
+                            continue;
+                        }
+                        let id = boon::EntityId::new(idx, entity.serial);
+                        if breakable_pending.contains_key(&id) {
+                            continue;
+                        }
+                        let [x, y, z] = keys.position(entity);
+                        breakable_live.insert(
+                            id,
+                            BreakableState {
+                                subclass_id: entity.get_u32(keys.subclass_id),
+                                team: entity.get_i64(keys.team) as i32,
+                                x,
+                                y,
+                                z,
+                            },
+                        );
+                    }
+                    for change in changes {
+                        if change.class_name.as_ref() != BREAKABLE_CLASS {
+                            continue;
+                        }
+                        let removed = match change.kind {
+                            boon::EntityChangeKind::LeftPvs => true,
+                            boon::EntityChangeKind::Deleted => {
+                                if let Some(entity) = ctx.entities().get(change.index) {
+                                    if boon::EntityId::new(entity.index, entity.serial)
+                                        != change.id()
+                                    {
+                                        breakable_live.remove(&change.id());
+                                    }
+                                    false
+                                } else {
+                                    true
+                                }
+                            }
+                            _ => false,
+                        };
+                        if removed && let Some(state) = breakable_live.remove(&change.id()) {
+                            breakable_pending
+                                .entry(change.id())
+                                .or_insert((ctx.tick(), state));
+                        }
+                    }
+                }
+
+                // Sinner's Sacrifice machines stay on the map. Emit sparse
+                // spawn/hit/reset rows whenever their health changes.
+                if sinner_keys.is_none() {
+                    sinner_keys = SINNER_CLASSES
+                        .iter()
+                        .find_map(|class| ctx.serializers().get(class))
+                        .map(MapEntityKeys::resolve);
+                }
+                if let Some(keys) = sinner_keys {
+                    for change in ctx.entities().entity_changes() {
+                        if !SINNER_CLASSES.contains(&change.class_name.as_ref())
+                            || change.kind != boon::EntityChangeKind::Deleted
+                        {
+                            continue;
+                        }
+                        let current_id = ctx
+                            .entities()
+                            .get(change.index)
+                            .map(|entity| boon::EntityId::new(entity.index, entity.serial));
+                        if current_id != Some(change.id()) {
+                            sinner_health.remove(&change.id());
+                        }
+                    }
+                    for &idx in ctx.entities().updated_indices() {
+                        let Some(entity) = ctx.entities().get(idx) else {
+                            continue;
+                        };
+                        if !SINNER_CLASSES.contains(&entity.class_name.as_ref()) {
+                            continue;
+                        }
+                        let health = entity.get_i64(keys.health) as i32;
+                        let max_health = entity.get_i64(keys.max_health) as i32;
+                        if health <= 0 || max_health <= 0 {
+                            continue;
+                        }
+                        let id = boon::EntityId::new(idx, entity.serial);
+                        let [x, y, z] = keys.position(entity);
+                        let transition = match sinner_health.insert(id, health) {
+                            None => Some(("spawned", 0)),
+                            Some(previous) if health > previous => Some(("reset", 0)),
+                            Some(previous) if health < previous => {
+                                Some(("hit", previous.saturating_sub(health)))
+                            }
+                            _ => None,
+                        };
+                        if let Some((event, damage)) = transition {
+                            sinner_events.push(SinnerEvent {
+                                tick: ctx.tick(),
+                                event,
+                                id: idx,
+                                serial: id.serial,
+                                health,
+                                max_health,
+                                damage,
+                                x,
+                                y,
+                                z,
+                            });
                         }
                     }
                 }
@@ -1159,7 +1187,10 @@ impl DemoParser {
                                     let raw_y = get_f32(e, pk_y);
                                     let cx = get_i64(e, pk_cell_x) as i32;
                                     let cy = get_i64(e, pk_cell_y) as i32;
-                                    (cell_to_world(cx, raw_x), cell_to_world(cy, raw_y))
+                                    (
+                                        boon::cell_to_world(cx, raw_x),
+                                        boon::cell_to_world(cy, raw_y),
+                                    )
                                 })
                                 .unwrap_or((0.0, 0.0));
                             kill_events_raw.push(RawKillEvent {
@@ -1265,164 +1296,75 @@ impl DemoParser {
                     }
                 }
 
-                // --- Active modifiers: diff the ActiveModifiers table -----
-                // Runs every tick (not just sampled frames) so span
-                // boundaries are exact. We only re-decode the entries the
-                // delta touched this tick (`dirty_indices`) and keep an entry
-                // index → serial map: a removal is either an explicit
-                // `entry_type == 2` or a slot reused by a new serial — both
-                // are changes to that index, so both are caught here.
-                if let Some(table) = ctx.string_tables().find_table("ActiveModifiers") {
-                    use prost::Message;
-                    for &idx in table.dirty_indices() {
-                        let Some(entry) = table.entries().get(idx) else {
-                            continue;
-                        };
-                        let Some(data) = entry.user_data.as_ref().filter(|d| !d.is_empty()) else {
-                            continue;
-                        };
-                        let Ok(m) = boon_proto::proto::CModifierTableEntry::decode(data.as_slice())
-                        else {
-                            continue;
-                        };
-                        let Some(serial) = m.serial_number else {
-                            continue;
-                        };
-
-                        // Slot reused by a different serial → the old modifier
-                        // left without an explicit removal entry.
-                        if let Some(old) = mod_idx_serial.get(&idx).copied()
-                            && old != serial
+                // Boon merges partial ActiveModifiers protobufs and reports
+                // applied/changed/removed lifecycles with complete entries.
+                for change in modifier_state.update(ctx) {
+                    let serial = change.serial;
+                    if change.kind == boon::ModifierChangeKind::Removed {
+                        if let Some(open) = mod_open.remove(&serial) {
+                            modifier_spans.push(open.into_span(Some(ctx.tick())));
+                        }
+                        if let Some(pawn) = barrier_serial_pawn.remove(&serial)
+                            && !barrier_serial_pawn.values().any(|other| *other == pawn)
                         {
-                            if let Some(pawn) = barrier_serial_pawn.remove(&old) {
-                                barrier_by_pawn.remove(&pawn);
-                            }
-                            if let Some(open) = mod_open.remove(&old) {
-                                modifier_spans.push(open.into_span(Some(ctx.tick())));
-                            }
+                            barrier_by_pawn.remove(&pawn);
                         }
+                        continue;
+                    }
 
-                        // Explicit removal (MODIFIER_ENTRY_TYPE_REMOVED == 2).
-                        if m.entry_type == Some(2) {
-                            mod_idx_serial.remove(&idx);
-                            if let Some(open) = mod_open.remove(&serial) {
-                                modifier_spans.push(open.into_span(Some(ctx.tick())));
-                            }
-                            if let Some(pawn) = barrier_serial_pawn.remove(&serial) {
-                                barrier_by_pawn.remove(&pawn);
-                            }
-                            continue;
-                        }
-
-                        mod_idx_serial.insert(idx, serial);
-
-                        if m.modifier_subclass == Some(BARRIER_TRACKER_MODIFIER_ID)
-                            && let Some(parent_idx) = boon::protobuf_handle_index(m.parent)
-                        {
-                            let remaining = m
-                                .float2
-                                .or_else(|| barrier_by_pawn.get(&parent_idx).copied())
-                                .unwrap_or(0.0);
-                            barrier_by_pawn.insert(
-                                parent_idx,
-                                if remaining.is_finite() {
-                                    remaining.max(0.0)
-                                } else {
-                                    0.0
-                                },
-                            );
-                            if let Some(old_pawn) = barrier_serial_pawn.insert(serial, parent_idx)
-                                && old_pawn != parent_idx
-                            {
-                                barrier_by_pawn.remove(&old_pawn);
-                            }
-                        }
-
-                        // A live serial can be resent when the effect is
-                        // refreshed, its duration changes, or its stack count
-                        // moves. Preserve the value visible at each sampled
-                        // frame, but coalesce further updates before the next
-                        // frame; the browser cannot seek between those ticks
-                        // and one object per raw update would waste memory.
-                        // Indefinite modifiers ignore last_applied_time entirely
-                        // (zip-line updates it nearly every tick).
-                        if let Some(mut open) = mod_open.remove(&serial) {
-                            let next_stacks = m.stack_count.unwrap_or(open.stacks);
-                            let next_duration = m.duration.unwrap_or(open.duration);
-                            let next_last_applied =
-                                m.last_applied_time.unwrap_or(open.last_applied_time);
-                            let reapplied = next_duration > 0.0
-                                && next_last_applied.to_bits() != open.last_applied_time.to_bits();
-                            let changed = reapplied
-                                || next_duration.to_bits() != open.duration.to_bits()
-                                || next_stacks != open.stacks;
-
-                            if changed {
-                                let visible_at_a_frame =
-                                    last_emitted.is_some_and(|tick| open.start_tick <= tick);
-                                if visible_at_a_frame {
-                                    modifier_spans.push(open.clone().into_span(Some(ctx.tick())));
-                                    open.start_tick = ctx.tick();
-                                }
-                                if reapplied {
-                                    open.applied_reg_tick = active_ticks;
-                                }
-                                open.last_applied_time = next_last_applied;
-                                open.duration = next_duration;
-                                open.stacks = next_stacks;
-                            }
-                            mod_open.insert(serial, open);
-                            continue;
-                        }
-
-                        let Some(parent_idx) = boon::protobuf_handle_index(m.parent) else {
-                            continue;
-                        };
-                        let Some(&hero_id) = pawn_to_hero.get(&parent_idx) else {
-                            continue;
-                        };
-
-                        let ability_id = m.ability_subclass.unwrap_or(0);
-                        let an = boon::ability_name(ability_id);
-                        let ability_name = if an == "ABILITY_NOT_FOUND" {
-                            String::new()
-                        } else {
-                            an.to_string()
-                        };
-                        let mn = boon::modifier_name(m.modifier_subclass.unwrap_or(0));
-                        let modifier_name = if mn == "MODIFIER_NOT_FOUND" {
-                            String::new()
-                        } else {
-                            mn.to_string()
-                        };
-                        // "Only show what resolves": need a label from either
-                        // the source ability/item or the modifier itself.
-                        if ability_name.is_empty() && modifier_name.is_empty() {
-                            continue;
-                        }
-
-                        let caster_hero_id = boon::protobuf_handle_index(m.caster)
-                            .and_then(|i| pawn_to_hero.get(&i).copied())
-                            .unwrap_or(0);
-
-                        mod_open.insert(
-                            serial,
-                            OpenModifier {
-                                hero_id,
-                                ability_id,
-                                ability_name,
-                                modifier_name,
-                                caster_hero_id,
-                                stacks: m.stack_count.unwrap_or(0),
-                                duration: m.duration.unwrap_or(-1.0),
-                                start_tick: ctx.tick(),
-                                applied_reg_tick: active_ticks,
-                                last_applied_time: m.last_applied_time.unwrap_or(-1.0),
+                    let m = &change.entry;
+                    if m.modifier_subclass == Some(BARRIER_TRACKER_MODIFIER_ID)
+                        && let Some(parent_idx) = boon::protobuf_handle_index(m.parent)
+                    {
+                        let remaining = m.float2.unwrap_or(0.0);
+                        barrier_by_pawn.insert(
+                            parent_idx,
+                            if remaining.is_finite() {
+                                remaining.max(0.0)
+                            } else {
+                                0.0
                             },
                         );
+                        if let Some(old_pawn) = barrier_serial_pawn.insert(serial, parent_idx)
+                            && old_pawn != parent_idx
+                            && !barrier_serial_pawn.values().any(|other| *other == old_pawn)
+                        {
+                            barrier_by_pawn.remove(&old_pawn);
+                        }
                     }
-                }
 
+                    let Some(mut next) = OpenModifier::from_entry(
+                        serial,
+                        m,
+                        ctx.tick(),
+                        active_ticks,
+                        &pawn_to_hero,
+                    ) else {
+                        continue;
+                    };
+                    if let Some(mut open) = mod_open.remove(&serial) {
+                        let reapplied = next.duration > 0.0
+                            && next.last_applied_time.to_bits() != open.last_applied_time.to_bits();
+                        if !open.same_visible_state(&next) {
+                            let visible_at_a_frame =
+                                last_emitted.is_some_and(|tick| open.start_tick <= tick);
+                            if visible_at_a_frame {
+                                modifier_spans.push(open.clone().into_span(Some(ctx.tick())));
+                                open.start_tick = ctx.tick();
+                            }
+                            next.start_tick = open.start_tick;
+                            next.applied_reg_tick = if reapplied {
+                                active_ticks
+                            } else {
+                                open.applied_reg_tick
+                            };
+                        } else {
+                            next.start_tick = open.start_tick;
+                            next.applied_reg_tick = open.applied_reg_tick;
+                        }
+                    }
+                    mod_open.insert(serial, next);
+                }
                 // --- Ability cooldown / charge state (change-only) ---------
                 // Walk only the ability entities that changed this tick; emit a
                 // row when an ability's cooldown/charge fields differ from last
@@ -1516,8 +1458,8 @@ impl DemoParser {
                     let team = get_i64(entity, keys.team) as i32;
                     let cx = get_i64(entity, keys.cell_x) as i32;
                     let cy = get_i64(entity, keys.cell_y) as i32;
-                    let wx = cell_to_world(cx, get_f32(entity, keys.vec_x));
-                    let wy = cell_to_world(cy, get_f32(entity, keys.vec_y));
+                    let wx = boon::cell_to_world(cx, get_f32(entity, keys.vec_x));
+                    let wy = boon::cell_to_world(cy, get_f32(entity, keys.vec_y));
 
                     obj_roster.entry(idx).or_insert_with(|| ObjectiveBuild {
                         kind: objective_kind(&entity.class_name),
@@ -1558,8 +1500,10 @@ impl DemoParser {
                         if e.class_name.as_ref() != NEUTRAL_CLASS {
                             continue;
                         }
-                        let x = cell_to_world(get_i64(e, nk_cell_x) as i32, get_f32(e, nk_vec_x));
-                        let y = cell_to_world(get_i64(e, nk_cell_y) as i32, get_f32(e, nk_vec_y));
+                        let x =
+                            boon::cell_to_world(get_i64(e, nk_cell_x) as i32, get_f32(e, nk_vec_x));
+                        let y =
+                            boon::cell_to_world(get_i64(e, nk_cell_y) as i32, get_f32(e, nk_vec_y));
                         let alive = get_i64(e, nk_life) == 0;
                         let tier = neutral_tier(get_i64(e, nk_max_health) as i32);
                         neutrals.push((idx, x, y, alive, tier));
@@ -1616,7 +1560,9 @@ impl DemoParser {
                     }
                 }
 
-                // Build a hero_id → controller_stats map for this tick.
+                // Build the controller stats once per sampled frame. Boon owns
+                // the cross-build stat IDs, item catalog, hero progression,
+                // active-modifier formulas, and resistance stacking rules.
                 let mut stats_by_hero: HashMap<i64, PlayerStats> = HashMap::new();
                 if ctrl_keys_resolved {
                     for (_, entity) in ctx.entities().iter() {
@@ -1627,36 +1573,82 @@ impl DemoParser {
                         if hero_id == 0 {
                             continue;
                         }
-                        // Sum each stat-modifier slot's m_flValue into the
-                        // appropriate cumulative bucket (eValType identifies
-                        // which stat the slot is contributing to).
-                        let mut bonus_health = 0.0_f32;
-                        let mut spirit_power = 0.0_f32;
-                        let mut fire_rate = 0.0_f32;
-                        let mut weapon_damage = 0.0_f32;
-                        let mut cooldown_reduction = 0.0_f32;
-                        let mut ammo = 0.0_f32;
-                        for (vt_key, val_key) in &ck_stat_keys {
-                            let vt = get_i64(entity, *vt_key) as u32;
-                            if vt == 0 {
+
+                        let mut bonus_health = 0.0;
+                        let mut ammo = 0.0;
+                        for (value_type_key, value_key) in &ck_stat_keys {
+                            let Some(decoded) = boon::decode_stat_modifier_value_type(
+                                entity.get_u32(*value_type_key),
+                            ) else {
                                 continue;
-                            }
-                            let v = get_f32(entity, *val_key);
-                            // These ids are EModifierValue enum values. They are
-                            // NOT in GameTracking/boon-proto, so they can't be
-                            // auto-synced — after a game update, verify them with
-                            // scripts/check-modifier-values.ts against a schema
-                            // dump. This match is the source of truth.
-                            match vt {
-                                31 => bonus_health += v,
-                                51 => spirit_power += v,
-                                79 => fire_rate += v,
-                                18 => weapon_damage += v,
-                                109 => cooldown_reduction += v,
-                                172 => ammo += v,
+                            };
+                            let value = entity.get_f32(*value_key) * decoded.value_scale;
+                            match decoded.kind {
+                                boon::StatModifierKind::Health => bonus_health += value,
+                                boon::StatModifierKind::Ammo => ammo += value,
                                 _ => {}
                             }
                         }
+
+                        let upgrade_count = get_i64(entity, ck_upgrade_count)
+                            .clamp(0, UPGRADE_SLOTS as i64)
+                            as usize;
+                        let upgrades: Vec<u32> = ck_upgrade_keys[..upgrade_count]
+                            .iter()
+                            .map(|key| entity.get_u32(*key))
+                            .filter(|id| *id != 0)
+                            .collect();
+                        let mut ability_tiers = HashMap::with_capacity(ABILITY_UPGRADE_SLOTS);
+                        let mut slots = Vec::with_capacity(SIGNATURE_ABILITY_SLOTS);
+                        for (slot_idx, (item_key, bits_key)) in ck_ability_keys.iter().enumerate() {
+                            let ability_id = entity.get_u32(*item_key);
+                            if ability_id == 0 {
+                                continue;
+                            }
+                            let level =
+                                (entity.get_u32(*bits_key) >> 17).count_ones().min(3) as i32;
+                            ability_tiers.insert(ability_id, level as u8);
+                            if slot_idx >= SIGNATURE_ABILITY_SLOTS {
+                                continue;
+                            }
+                            slots.push(AbilitySlot {
+                                ability_id,
+                                ability_name: boon::ability_name(ability_id).to_string(),
+                            });
+                            let previous = ability_prev_level
+                                .get(&(hero_id, slot_idx))
+                                .copied()
+                                .unwrap_or(0);
+                            if level > previous {
+                                ability_prev_level.insert((hero_id, slot_idx), level);
+                                ability_upgrade_events.push(AbilityUpgradeEvent {
+                                    tick: ctx.tick(),
+                                    hero_id,
+                                    ability_id,
+                                    level,
+                                });
+                            }
+                        }
+                        if should_replace_ability_slots(
+                            ability_slots.get(&hero_id).map(Vec::as_slice),
+                            &slots,
+                        ) && !slots.is_empty()
+                        {
+                            ability_slots.insert(hero_id, slots);
+                        }
+
+                        let pawn_index = entity
+                            .get_handle(ck_pawn)
+                            .and_then(|handle| boon::protobuf_handle_index(Some(handle)));
+                        let layers = boon::evaluate_player_stats(
+                            hero_id,
+                            get_i64(entity, ck_level),
+                            &upgrades,
+                            &ability_tiers,
+                            modifier_state.entries().values().filter(|entry| {
+                                boon::protobuf_handle_index(entry.parent) == pawn_index
+                            }),
+                        );
                         stats_by_hero.insert(
                             hero_id,
                             PlayerStats {
@@ -1670,56 +1662,20 @@ impl DemoParser {
                                 objective_damage: get_i64(entity, ck_objective_damage) as i32,
                                 health_max: get_i64(entity, ck_health_max) as i32,
                                 bonus_health,
-                                spirit_power,
-                                fire_rate,
-                                weapon_damage,
-                                cooldown_reduction,
+                                spirit_power: layers.effective[boon::StatId::SpiritPower],
+                                fire_rate: layers.effective[boon::StatId::FireRateBonus],
+                                weapon_damage: layers.effective[boon::StatId::WeaponDamageBonus],
+                                cooldown_reduction: layers.effective
+                                    [boon::StatId::CooldownReduction],
                                 ammo,
+                                bullet_resist: layers.effective[boon::StatId::BulletResist],
+                                spirit_resist: layers.effective[boon::StatId::SpiritResist],
+                                status_resist: layers.effective[boon::StatId::StatusResist],
+                                bullet_lifesteal: layers.effective[boon::StatId::BulletLifesteal],
+                                spirit_lifesteal: layers.effective[boon::StatId::SpiritLifesteal],
+                                stat_complete_mask: stat_complete_mask(layers.complete),
                             },
                         );
-
-                        // Ability upgrades. Each non-empty slot is one of the
-                        // hero's abilities; m_nUpgradeInfo packs the spent
-                        // upgrade tiers as a bitmask in bits 17+, so the popcount
-                        // of (raw >> 17) is the level (0 = unlocked/no tiers, up
-                        // to 3). We capture the constant per-hero ability set
-                        // once and log only level *increases* as events.
-                        let mut slots: Vec<AbilitySlot> = Vec::new();
-                        for (slot_idx, (item_key, bits_key)) in ck_ability_keys.iter().enumerate() {
-                            let ability_id = get_i64(entity, *item_key) as u32;
-                            if ability_id == 0 {
-                                continue;
-                            }
-                            slots.push(AbilitySlot {
-                                ability_id,
-                                ability_name: boon::ability_name(ability_id).to_string(),
-                            });
-                            let raw = get_i64(entity, *bits_key);
-                            let level = ((raw >> 17) as i32).count_ones() as i32;
-                            let prev = ability_prev_level
-                                .get(&(hero_id, slot_idx))
-                                .copied()
-                                .unwrap_or(0);
-                            if level > prev {
-                                ability_prev_level.insert((hero_id, slot_idx), level);
-                                ability_upgrade_events.push(AbilityUpgradeEvent {
-                                    tick: ctx.tick(),
-                                    hero_id,
-                                    ability_id,
-                                    level,
-                                });
-                            }
-                        }
-                        // Slots and hero ID do not update atomically during hero
-                        // initialization. Accept a different equal-length set so
-                        // a transient previous-hero set cannot become permanent.
-                        let better = should_replace_ability_slots(
-                            ability_slots.get(&hero_id).map(Vec::as_slice),
-                            &slots,
-                        );
-                        if better && !slots.is_empty() {
-                            ability_slots.insert(hero_id, slots);
-                        }
                     }
                 }
 
@@ -1750,18 +1706,16 @@ impl DemoParser {
                     let stats = stats_by_hero.get(&hero_id).copied().unwrap_or_default();
 
                     // Look direction: QAngle is [pitch, yaw, roll] in degrees.
-                    let eye = get_qangle(entity, pk_eye);
-                    let pitch = eye.map(|a| a[0]).unwrap_or(0.0);
-                    let yaw = eye.map(|a| a[1]).unwrap_or(0.0);
+                    let [pitch, yaw, _] = entity.get_qangle(pk_eye);
 
                     players.push(PlayerPosition {
                         slot: idx,
                         team,
                         hero_id,
                         alive: get_i64(entity, pk_life) == 0,
-                        x: cell_to_world(cx, raw_x),
-                        y: cell_to_world(cy, raw_y),
-                        z: cell_to_world(cz, raw_z),
+                        x: boon::cell_to_world(cx, raw_x),
+                        y: boon::cell_to_world(cy, raw_y),
+                        z: boon::cell_to_world(cz, raw_z),
                         yaw,
                         pitch,
                         health: get_i64(entity, pk_health) as i32,
@@ -1788,6 +1742,12 @@ impl DemoParser {
                         weapon_damage: stats.weapon_damage,
                         cooldown_reduction: stats.cooldown_reduction,
                         ammo: stats.ammo,
+                        bullet_resist: stats.bullet_resist,
+                        spirit_resist: stats.spirit_resist,
+                        status_resist: stats.status_resist,
+                        bullet_lifesteal: stats.bullet_lifesteal,
+                        spirit_lifesteal: stats.spirit_lifesteal,
+                        stat_complete_mask: stats.stat_complete_mask,
                     });
                 }
 
@@ -1812,8 +1772,10 @@ impl DemoParser {
                         if e.class_name.as_ref() != TROOPER_CLASS || get_i64(e, tk_life) != 0 {
                             continue;
                         }
-                        let x = cell_to_world(get_i64(e, tk_cell_x) as i32, get_f32(e, tk_vec_x));
-                        let y = cell_to_world(get_i64(e, tk_cell_y) as i32, get_f32(e, tk_vec_y));
+                        let x =
+                            boon::cell_to_world(get_i64(e, tk_cell_x) as i32, get_f32(e, tk_vec_x));
+                        let y =
+                            boon::cell_to_world(get_i64(e, tk_cell_y) as i32, get_f32(e, tk_vec_y));
                         troopers.push(pack_trooper(x, y, get_i64(e, tk_team)));
                     }
                 }
@@ -1827,8 +1789,10 @@ impl DemoParser {
                     if e.class_name.as_ref() != IDOL_CLASS {
                         continue;
                     }
-                    let x = cell_to_world(get_i64(e, idk_cell_x) as i32, get_f32(e, idk_vec_x));
-                    let y = cell_to_world(get_i64(e, idk_cell_y) as i32, get_f32(e, idk_vec_y));
+                    let x =
+                        boon::cell_to_world(get_i64(e, idk_cell_x) as i32, get_f32(e, idk_vec_x));
+                    let y =
+                        boon::cell_to_world(get_i64(e, idk_cell_y) as i32, get_f32(e, idk_vec_y));
                     urns.push(x);
                     urns.push(y);
                 }
@@ -1839,11 +1803,11 @@ impl DemoParser {
                     && let Some(e) = ctx.entities().get(cp)
                     && e.class_name.as_ref() == PAWN_CLASS
                 {
-                    urns.push(cell_to_world(
+                    urns.push(boon::cell_to_world(
                         get_i64(e, pk_cell_x) as i32,
                         get_f32(e, pk_x),
                     ));
-                    urns.push(cell_to_world(
+                    urns.push(boon::cell_to_world(
                         get_i64(e, pk_cell_y) as i32,
                         get_f32(e, pk_y),
                     ));
@@ -1882,6 +1846,22 @@ impl DemoParser {
             modifier_spans.push(open.into_span(None));
         }
         modifier_spans.sort_by_key(|s| s.start_tick);
+
+        let mut breakable_events: Vec<BreakableEvent> = breakable_pending
+            .into_iter()
+            .map(|(id, (tick, state))| BreakableEvent {
+                tick,
+                id: id.index,
+                serial: id.serial,
+                subclass_name: boon::breakable_name(state.subclass_id).to_string(),
+                team: state.team,
+                x: state.x,
+                y: state.y,
+                z: state.z,
+            })
+            .collect();
+        breakable_events.sort_by_key(|event| (event.tick, event.id, event.serial));
+        sinner_events.sort_by_key(|event| (event.tick, event.id, event.serial));
 
         // Resolve raw item events to hero-keyed events. Drop events whose
         // slot we never saw (rare; mostly events fired before a controller
@@ -2042,7 +2022,6 @@ impl DemoParser {
             winner,
             game_mode,
             match_mode,
-            paths: resolved_paths.unwrap_or_default(),
             item_events,
             kill_events,
             fire_events,
@@ -2055,6 +2034,8 @@ impl DemoParser {
             objective_health: obj_health_events,
             neutral_camps,
             camp_state_events,
+            breakable_events,
+            sinner_events,
             chat_events,
             modifier_spans,
             pause_intervals,
@@ -2076,7 +2057,6 @@ struct PositionsResult {
     game_mode: i32,
     /// `ECitadelMatchMode`: 4 = ranked; regular matchmaking is 1.
     match_mode: i32,
-    paths: ResolvedPaths,
     item_events: Vec<ItemEvent>,
     kill_events: Vec<KillEvent>,
     /// Per-frame gun-shot tallies per hero (count > 0 only); `tick` matches a
@@ -2102,6 +2082,10 @@ struct PositionsResult {
     neutral_camps: Vec<NeutralCamp>,
     /// Sparse camp up/down transitions; reconstructed per tick.
     camp_state_events: Vec<CampStateEvent>,
+    /// Confirmed breakable-prop destruction events.
+    breakable_events: Vec<BreakableEvent>,
+    /// Sparse Sinner's Sacrifice machine lifecycle and health events.
+    sinner_events: Vec<SinnerEvent>,
     /// Player chat (all + team), in tick order.
     chat_events: Vec<ChatEvent>,
     /// Per-player active buff/debuff spans (from the ActiveModifiers table),
@@ -2232,6 +2216,8 @@ struct ChatEvent {
 /// `applied_reg_tick` anchors that countdown to non-paused match time.
 #[derive(Clone)]
 struct OpenModifier {
+    serial: u32,
+    modifier_id: u32,
     hero_id: i64,
     ability_id: u32,
     ability_name: String,
@@ -2245,8 +2231,61 @@ struct OpenModifier {
 }
 
 impl OpenModifier {
+    fn from_entry(
+        serial: u32,
+        entry: &boon_proto::proto::CModifierTableEntry,
+        tick: i32,
+        reg_tick: i32,
+        pawn_to_hero: &HashMap<i32, i64>,
+    ) -> Option<Self> {
+        let parent = boon::protobuf_handle_index(entry.parent)?;
+        let hero_id = pawn_to_hero.get(&parent).copied()?;
+        let ability_id = entry.ability_subclass.unwrap_or(0);
+        let modifier_id = entry.modifier_subclass.unwrap_or(0);
+        let ability_name = match boon::ability_name(ability_id) {
+            "ABILITY_NOT_FOUND" => String::new(),
+            name => name.to_string(),
+        };
+        let modifier_name = match boon::modifier_name(modifier_id) {
+            "MODIFIER_NOT_FOUND" => String::new(),
+            name => name.to_string(),
+        };
+        if ability_name.is_empty() && modifier_name.is_empty() {
+            return None;
+        }
+        let caster_hero_id = boon::protobuf_handle_index(entry.caster)
+            .and_then(|index| pawn_to_hero.get(&index).copied())
+            .unwrap_or(0);
+        Some(Self {
+            serial,
+            modifier_id,
+            hero_id,
+            ability_id,
+            ability_name,
+            modifier_name,
+            caster_hero_id,
+            stacks: entry.stack_count.unwrap_or(0),
+            duration: entry.duration.unwrap_or(-1.0),
+            start_tick: tick,
+            applied_reg_tick: reg_tick,
+            last_applied_time: entry.last_applied_time.unwrap_or(-1.0),
+        })
+    }
+
+    fn same_visible_state(&self, other: &Self) -> bool {
+        self.hero_id == other.hero_id
+            && self.ability_id == other.ability_id
+            && self.modifier_id == other.modifier_id
+            && self.caster_hero_id == other.caster_hero_id
+            && self.stacks == other.stacks
+            && self.duration.to_bits() == other.duration.to_bits()
+            && self.last_applied_time.to_bits() == other.last_applied_time.to_bits()
+    }
+
     fn into_span(self, end_tick: Option<i32>) -> ModifierSpan {
         ModifierSpan {
+            serial: self.serial,
+            modifier_id: self.modifier_id,
             hero_id: self.hero_id,
             start_tick: self.start_tick,
             end_tick,
@@ -2264,10 +2303,12 @@ impl OpenModifier {
 /// One stable segment of a modifier's lifetime over [start_tick, end_tick).
 /// In-place refresh/stack/duration updates split a serial into adjacent segments
 /// so seeking reconstructs the values at that tick. `applied_reg_tick` is the
-/// most recent application in non-paused ticks and anchors the countdown;
+/// most recent application in non-paused ticks and anchors the countdown.
 /// `duration` is seconds (-1 = indefinite).
 #[derive(Serialize)]
 struct ModifierSpan {
+    serial: u32,
+    modifier_id: u32,
     hero_id: i64,
     start_tick: i32,
     end_tick: Option<i32>,
@@ -2278,6 +2319,74 @@ struct ModifierSpan {
     caster_hero_id: i64,
     stacks: i32,
     duration: f32,
+}
+
+#[derive(Clone, Copy)]
+struct MapEntityKeys {
+    cell: [Option<u64>; 3],
+    offset: [Option<u64>; 3],
+    team: Option<u64>,
+    health: Option<u64>,
+    max_health: Option<u64>,
+    subclass_id: Option<u64>,
+}
+
+impl MapEntityKeys {
+    fn resolve(serializer: &Serializer) -> Self {
+        let origin = "CBodyComponent.m_skeletonInstance.m_vecOrigin";
+        let field = |name: &str| serializer.resolve_field_key(name);
+        Self {
+            cell: std::array::from_fn(|axis| {
+                field(&format!("{origin}.m_cell{}", ['X', 'Y', 'Z'][axis]))
+            }),
+            offset: std::array::from_fn(|axis| {
+                field(&format!("{origin}.m_vec{}", ['X', 'Y', 'Z'][axis]))
+            }),
+            team: field("m_iTeamNum"),
+            health: field("m_iHealth"),
+            max_health: field("m_iMaxHealth"),
+            subclass_id: field("m_nSubclassID"),
+        }
+    }
+
+    fn position(self, entity: &boon::Entity) -> [f32; 3] {
+        entity.world_position(self.cell, self.offset)
+    }
+}
+
+#[derive(Clone, Copy)]
+struct BreakableState {
+    subclass_id: u32,
+    team: i32,
+    x: f32,
+    y: f32,
+    z: f32,
+}
+
+#[derive(Serialize)]
+struct BreakableEvent {
+    tick: i32,
+    id: i32,
+    serial: u32,
+    subclass_name: String,
+    team: i32,
+    x: f32,
+    y: f32,
+    z: f32,
+}
+
+#[derive(Serialize)]
+struct SinnerEvent {
+    tick: i32,
+    event: &'static str,
+    id: i32,
+    serial: u32,
+    health: i32,
+    max_health: i32,
+    damage: i32,
+    x: f32,
+    y: f32,
+    z: f32,
 }
 
 /// An objective destruction. `kind` is a stable slug ("guardian", "walker",
@@ -2395,18 +2504,6 @@ struct CampStateEvent {
     up: bool,
 }
 
-#[derive(Default, Serialize)]
-struct ResolvedPaths {
-    vec_x: Option<String>,
-    vec_y: Option<String>,
-    vec_z: Option<String>,
-    cell_x: Option<String>,
-    cell_y: Option<String>,
-    cell_z: Option<String>,
-    team: Option<String>,
-    life: Option<String>,
-}
-
 #[derive(Serialize)]
 struct PlayerInfo {
     name: String,
@@ -2417,8 +2514,8 @@ struct PlayerInfo {
     rank: i64,
 }
 
-const PLAYER_I32_STRIDE: usize = 14;
-const PLAYER_F32_STRIDE: usize = 12;
+const PLAYER_I32_STRIDE: usize = 15;
+const PLAYER_F32_STRIDE: usize = 17;
 
 /// Columnar sampled-frame storage. Numeric typed arrays are both much smaller
 /// than nested JavaScript objects and transferable from the worker without a
@@ -2483,6 +2580,7 @@ impl PackedFrames {
                 player.hero_damage,
                 player.hero_healing,
                 player.objective_damage,
+                player.stat_complete_mask,
             ]);
             self.player_f32.extend_from_slice(&[
                 player.x,
@@ -2497,6 +2595,11 @@ impl PackedFrames {
                 player.cooldown_reduction,
                 player.ammo,
                 player.barrier,
+                player.bullet_resist,
+                player.spirit_resist,
+                player.status_resist,
+                player.bullet_lifesteal,
+                player.spirit_lifesteal,
             ]);
         }
         self.player_offsets
@@ -2546,19 +2649,6 @@ fn set_js_property(target: &JsValue, name: &str, value: &JsValue) -> Result<(), 
         .map_err(|_| JsError::new(&format!("failed to set {name}")))
 }
 
-#[allow(dead_code)]
-#[derive(Serialize)]
-struct PositionFrame {
-    tick: i32,
-    /// Active (non-paused) ticks elapsed at this frame — the regulation clock.
-    reg_ticks: i32,
-    players: Vec<PlayerPosition>,
-    /// Alive lane troopers, packed (see pack_trooper) to keep frames compact.
-    troopers: Vec<i32>,
-    /// Live urn (Idol) world positions, flat [x0, y0, x1, y1, …].
-    urns: Vec<f32>,
-}
-
 #[derive(Serialize)]
 struct PlayerPosition {
     slot: i32,
@@ -2592,6 +2682,12 @@ struct PlayerPosition {
     weapon_damage: f32,
     cooldown_reduction: f32,
     ammo: f32,
+    bullet_resist: f32,
+    spirit_resist: f32,
+    status_resist: f32,
+    bullet_lifesteal: f32,
+    spirit_lifesteal: f32,
+    stat_complete_mask: i32,
 }
 
 /// One of a hero's signature abilities (constant for the match), emitted once
@@ -2633,6 +2729,14 @@ struct AbilityUpgradeEvent {
     level: i32,
 }
 
+fn stat_complete_mask(mask: boon::StatMask) -> i32 {
+    boon::StatId::ALL
+        .into_iter()
+        .enumerate()
+        .filter_map(|(bit, stat)| mask.contains(stat).then_some(1_i32 << bit))
+        .fold(0, |bits, bit| bits | bit)
+}
+
 #[derive(Default, Clone, Copy)]
 struct PlayerStats {
     net_worth: i32,
@@ -2650,6 +2754,12 @@ struct PlayerStats {
     weapon_damage: f32,
     cooldown_reduction: f32,
     ammo: f32,
+    bullet_resist: f32,
+    spirit_resist: f32,
+    status_resist: f32,
+    bullet_lifesteal: f32,
+    spirit_lifesteal: f32,
+    stat_complete_mask: i32,
 }
 
 fn get_i64(e: &boon::Entity, key: Option<u64>) -> i64 {
@@ -2673,15 +2783,6 @@ fn get_f32(e: &boon::Entity, key: Option<u64>) -> f32 {
         .unwrap_or(0.0)
 }
 
-/// Read a QAngle / Vector3 field as `[x, y, z]` (degrees for angles).
-fn get_qangle(e: &boon::Entity, key: Option<u64>) -> Option<[f32; 3]> {
-    key.and_then(|k| e.fields.get(&k)).and_then(|v| match v {
-        boon::FieldValue::QAngle(a) => Some(*a),
-        boon::FieldValue::Vector3(a) => Some(*a),
-        _ => None,
-    })
-}
-
 fn get_string(e: &boon::Entity, key: Option<u64>) -> String {
     key.and_then(|k| e.fields.get(&k))
         .and_then(|v| match v {
@@ -2689,35 +2790,6 @@ fn get_string(e: &boon::Entity, key: Option<u64>) -> String {
             _ => None,
         })
         .unwrap_or_default()
-}
-
-const CELL_BITS: u32 = 9;
-const CELL_SIZE: f32 = (1 << CELL_BITS) as f32;
-const WORLD_HALF: f32 = 16384.0;
-
-fn cell_to_world(cell: i32, offset: f32) -> f32 {
-    (cell as f32) * CELL_SIZE - WORLD_HALF + offset
-}
-
-fn walk_fields(s: &Serializer, prefix: &str, out: &mut Vec<String>) {
-    for f in &s.fields {
-        let mut name = String::with_capacity(prefix.len() + 32);
-        if !prefix.is_empty() {
-            name.push_str(prefix);
-            name.push('.');
-        }
-        if let Some(sn) = f.send_node.as_deref()
-            && !sn.is_empty()
-        {
-            name.push_str(sn);
-            name.push('.');
-        }
-        name.push_str(&f.var_name);
-        out.push(name.clone());
-        if let Some(inner) = &f.field_serializer {
-            walk_fields(inner, &name, out);
-        }
-    }
 }
 
 fn to_js_error(e: boon::Error) -> JsError {

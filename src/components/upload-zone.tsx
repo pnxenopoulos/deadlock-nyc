@@ -21,6 +21,7 @@ import {
   type AbilitySlot,
   type AbilityTick,
   type AbilityUpgradeEvent,
+  type BreakableEvent,
   type ChatEvent,
   type FireEvent,
   type HeroAbilities,
@@ -39,6 +40,8 @@ import {
   type PauseInterval,
   type PlayerPosition,
   type RiftState,
+  type SinnerEvent,
+  type SinnerMachineState,
 } from "@/components/map-view";
 import { PlaybackConfig, SPEED_OPTIONS } from "@/components/playback-config";
 import {
@@ -79,6 +82,8 @@ const KILL_MARKER_TICKS = 10 * TICKS_PER_SECOND; // 10 seconds at 64 t/s = 640
 const STEP_TICKS = 640;
 // Objectives are rare and significant, so their map markers linger longer.
 const OBJECTIVE_MARKER_TICKS = 20 * TICKS_PER_SECOND;
+const BREAKABLE_MARKER_TICKS = 8 * TICKS_PER_SECOND;
+const SINNER_HIT_TICKS = TICKS_PER_SECOND / 2;
 const RIFT_CAPTURE_FADE_TICKS = 10 * TICKS_PER_SECOND;
 // Gold accent for neutral objectives (Mid-Boss) with no owning team.
 const NEUTRAL_OBJECTIVE_COLOR = "#c9a227";
@@ -113,6 +118,8 @@ type State =
       objectiveHealth: ObjectiveHealthEvent[];
       neutralCamps: NeutralCamp[];
       campStateEvents: CampStateEvent[];
+      breakableEvents: BreakableEvent[];
+      sinnerEvents: SinnerEvent[];
       chatEvents: ChatEvent[];
       modifierSpans: ModifierSpan[];
       pauseIntervals: PauseInterval[];
@@ -166,6 +173,8 @@ export function UploadZone() {
         objectiveHealth: parsed.positions.objective_health,
         neutralCamps: parsed.positions.neutral_camps,
         campStateEvents: parsed.positions.camp_state_events,
+        breakableEvents: parsed.positions.breakable_events,
+        sinnerEvents: parsed.positions.sinner_events,
         chatEvents: parsed.positions.chat_events,
         modifierSpans: parsed.positions.modifier_spans,
         pauseIntervals: parsed.positions.pause_intervals,
@@ -200,6 +209,8 @@ export function UploadZone() {
         objectiveHealth={state.objectiveHealth}
         neutralCamps={state.neutralCamps}
         campStateEvents={state.campStateEvents}
+        breakableEvents={state.breakableEvents}
+        sinnerEvents={state.sinnerEvents}
         chatEvents={state.chatEvents}
         modifierSpans={state.modifierSpans}
         pauseIntervals={state.pauseIntervals}
@@ -377,6 +388,8 @@ function DemoView({
   objectiveHealth,
   neutralCamps,
   campStateEvents,
+  breakableEvents,
+  sinnerEvents,
   chatEvents,
   modifierSpans,
   pauseIntervals,
@@ -400,6 +413,8 @@ function DemoView({
   objectiveHealth: ObjectiveHealthEvent[];
   neutralCamps: NeutralCamp[];
   campStateEvents: CampStateEvent[];
+  breakableEvents: BreakableEvent[];
+  sinnerEvents: SinnerEvent[];
   chatEvents: ChatEvent[];
   modifierSpans: ModifierSpan[];
   pauseIntervals: PauseInterval[];
@@ -902,6 +917,27 @@ function DemoView({
     }));
   }, [neutralCamps, campStateEvents, frame]);
 
+  const breakableMarkers = React.useMemo<BreakableEvent[]>(() => {
+    const tick = frame?.tick ?? 0;
+    return breakableEvents.filter(
+      (event) =>
+        event.tick <= tick && tick - event.tick <= BREAKABLE_MARKER_TICKS,
+    );
+  }, [breakableEvents, frame]);
+
+  const sinnerStates = React.useMemo<SinnerMachineState[]>(() => {
+    const tick = frame?.tick ?? 0;
+    const latest = new Map<string, SinnerEvent>();
+    for (const event of sinnerEvents) {
+      if (event.tick > tick) break;
+      latest.set(`${event.id}:${event.serial}`, event);
+    }
+    return [...latest.values()].map((event) => ({
+      ...event,
+      hit: event.event === "hit" && tick - event.tick <= SINNER_HIT_TICKS,
+    }));
+  }, [sinnerEvents, frame]);
+
   // Gun-shot tallies bucketed by frame tick (each fire event's tick matches a
   // frame). Built once; the map reads the current frame's bucket for pulses.
   const fireByTick = React.useMemo(() => {
@@ -1163,6 +1199,8 @@ function DemoView({
             objectiveStates={objectiveStates}
             rift={rift}
             campStates={campStates}
+            breakableMarkers={breakableMarkers}
+            sinnerStates={sinnerStates}
             firing={firing}
             onSelectPlayer={setSelectedHeroId}
           />
