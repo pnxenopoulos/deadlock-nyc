@@ -15,8 +15,7 @@
     "portraits": "bun run scripts/build-hero-portraits.ts",
     "ability-icons": "bun run scripts/build-ability-icons.ts",
     "ability-names": "bun run scripts/build-ability-names.ts",
-    "images": "bun run scripts/build-images.ts",
-    "check-modifiers": "bun run scripts/check-modifier-values.ts"
+    "images": "bun run scripts/build-images.ts"
   },
   "dependencies": {
     "@radix-ui/react-slider": "^1.3.6",

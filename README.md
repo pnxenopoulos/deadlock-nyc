@@ -2,8 +2,8 @@
 
 A fast, **fully client-side** demo (replay) viewer for [Deadlock](https://store.steampowered.com/app/1422450/Deadlock/),
 running entirely in your browser. Drop in a `.dem` file and scrub through the
-match on a live minimap — heroes, troopers, jungle camps, objectives, the urn,
-kills, abilities, item builds, and chat.
+match on a live minimap — heroes, troopers, jungle camps, breakables, objectives,
+Sinner's Sacrifice, the urn, kills, abilities, item builds, and chat.
 
 🔗 **Live:** [deadlock.nyc](https://deadlock.nyc)
 
@@ -22,11 +22,11 @@ and renders the parsed entities, events, and stats in the browser.
   WASM). No server, no upload.
 - **Live minimap** with surface / tunnel layers and pan + zoom:
   - Hero dots with team color, portrait, and a facing caret (yaw)
-  - Lane troopers, neutral jungle camps (chevrons sized by camp tier)
+  - Lane troopers, neutral jungle camps, breakable props, and Sinner's Sacrifice
   - Objectives — Guardians, Walkers, Shrines, the Patron, and the Mid-Boss —
     with live health rings
   - The **urn**, tracked through pickups and carries
-  - Per-layer toggles (heroes / troopers / neutrals / objectives / urn)
+  - Per-layer toggles for every map overlay
 - **Timeline scrubber** with play/pause, back/forward by a configurable step,
   adjustable playback speed, jump-to-tick, and pause-band markers.
 - **Keyboard shortcuts** — `Space` play/pause, `←` / `→` back/forward, `Esc`
@@ -34,8 +34,8 @@ and renders the parsed entities, events, and stats in the browser.
 - **Event feeds** (tabbed) — kills, ability usage, objectives (destructions,
   Mid-Boss, urn spawns, Rift lifecycle), and team-colored chat. Click any row
   to seek.
-- **Player detail panel** — collapsible Health, Abilities, Items (framed by
-  category with gun / vitality / spirit souls invested), and Bonuses.
+- **Player detail panel** — health and barrier, abilities, item investments,
+  active modifiers, and expanded combat stats including resistances and lifesteal.
 - **Dark / light themes.**
 
 ## Tech stack
@@ -48,7 +48,7 @@ and renders the parsed entities, events, and stats in the browser.
 
 ## Performance and memory
 
-The WASM adapter uses boon 0.7 and pbdems2 0.2.2. It requests only the event
+The WASM adapter uses boon 0.8 and pbdems2 0.3. It requests only the event
 types used by the UI and uses boon's changed-entity indices for roster and
 objective updates instead of rescanning every live entity each tick.
 

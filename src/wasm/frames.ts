@@ -5,11 +5,14 @@ export interface PlayerPosition {
   alive: boolean;
   x: number;
   y: number;
+  /** World height; negative values render on the tunnels layer. */
   z: number;
+  /** Look angles in degrees: yaw is horizontal facing; pitch is vertical. */
   yaw: number;
   pitch: number;
   health: number;
   max_health: number;
+  /** Current damage-absorbing barrier remaining. */
   barrier: number;
   net_worth: number;
   ap_net_worth: number;
@@ -18,6 +21,7 @@ export interface PlayerPosition {
   assists: number;
   hero_damage: number;
   hero_healing: number;
+  /** Cumulative damage dealt to objectives. */
   objective_damage: number;
   bonus_health: number;
   spirit_power: number;
@@ -25,13 +29,23 @@ export interface PlayerPosition {
   weapon_damage: number;
   cooldown_reduction: number;
   ammo: number;
+  bullet_resist: number;
+  spirit_resist: number;
+  status_resist: number;
+  bullet_lifesteal: number;
+  spirit_lifesteal: number;
+  /** Boon StatId completeness bits; unset values are best-effort estimates. */
+  stat_complete_mask: number;
 }
 
 export interface PositionFrame {
   tick: number;
+  /** Active, non-paused ticks elapsed at this frame. */
   reg_ticks: number;
   players: PlayerPosition[];
+  /** Alive lane troopers, packed by the Rust parser. */
   troopers: number[];
+  /** Live urn positions as flat x/y pairs. */
   urns: number[];
 }
 
@@ -49,8 +63,8 @@ export interface PackedFrameData {
   urns: Float32Array;
 }
 
-const PLAYER_I32_STRIDE = 14;
-const PLAYER_F32_STRIDE = 12;
+const PLAYER_I32_STRIDE = 15;
+const PLAYER_F32_STRIDE = 17;
 
 /** Compact, transferable storage for sampled frames.
  *
@@ -124,38 +138,8 @@ export class FrameStore {
     const playerEnd = this.packed.player_offsets[index + 1];
     const players: PlayerPosition[] = [];
     for (let row = playerStart; row < playerEnd; row++) {
-      const ii = row * PLAYER_I32_STRIDE;
-      const fi = row * PLAYER_F32_STRIDE;
-      players.push({
-        slot: this.packed.player_i32[ii],
-        team: this.packed.player_i32[ii + 1],
-        hero_id: this.packed.player_i32[ii + 2],
-        alive: this.packed.player_i32[ii + 3] !== 0,
-        x: this.packed.player_f32[fi],
-        y: this.packed.player_f32[fi + 1],
-        z: this.packed.player_f32[fi + 2],
-        yaw: this.packed.player_f32[fi + 3],
-        pitch: this.packed.player_f32[fi + 4],
-        health: this.packed.player_i32[ii + 4],
-        max_health: this.packed.player_i32[ii + 5],
-        net_worth: this.packed.player_i32[ii + 6],
-        ap_net_worth: this.packed.player_i32[ii + 7],
-        kills: this.packed.player_i32[ii + 8],
-        deaths: this.packed.player_i32[ii + 9],
-        assists: this.packed.player_i32[ii + 10],
-        hero_damage: this.packed.player_i32[ii + 11],
-        hero_healing: this.packed.player_i32[ii + 12],
-        objective_damage: this.packed.player_i32[ii + 13],
-        bonus_health: this.packed.player_f32[fi + 5],
-        spirit_power: this.packed.player_f32[fi + 6],
-        fire_rate: this.packed.player_f32[fi + 7],
-        weapon_damage: this.packed.player_f32[fi + 8],
-        cooldown_reduction: this.packed.player_f32[fi + 9],
-        ammo: this.packed.player_f32[fi + 10],
-        barrier: this.packed.player_f32[fi + 11],
-      });
+      players.push(this.playerAt(row));
     }
-
     const trooperStart = this.packed.trooper_offsets[index];
     const trooperEnd = this.packed.trooper_offsets[index + 1];
     const urnStart = this.packed.urn_offsets[index];
@@ -199,6 +183,7 @@ export class FrameStore {
       hero_damage: this.packed.player_i32[ii + 11],
       hero_healing: this.packed.player_i32[ii + 12],
       objective_damage: this.packed.player_i32[ii + 13],
+      stat_complete_mask: this.packed.player_i32[ii + 14],
       bonus_health: this.packed.player_f32[fi + 5],
       spirit_power: this.packed.player_f32[fi + 6],
       fire_rate: this.packed.player_f32[fi + 7],
@@ -206,6 +191,11 @@ export class FrameStore {
       cooldown_reduction: this.packed.player_f32[fi + 9],
       ammo: this.packed.player_f32[fi + 10],
       barrier: this.packed.player_f32[fi + 11],
+      bullet_resist: this.packed.player_f32[fi + 12],
+      spirit_resist: this.packed.player_f32[fi + 13],
+      status_resist: this.packed.player_f32[fi + 14],
+      bullet_lifesteal: this.packed.player_f32[fi + 15],
+      spirit_lifesteal: this.packed.player_f32[fi + 16],
     };
   }
 

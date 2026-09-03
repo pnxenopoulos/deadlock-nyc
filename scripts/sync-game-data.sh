@@ -117,8 +117,6 @@ Follow-up steps (these can't be pulled from GameTracking):
   - Name tables: bump the `boon` crate when its hero/ability id->internal-name
     tables change, then `bun run wasm`. Localized ability labels come from this
     sync's Valve localization files.
-  - Modifiers: verify the stat-type ids in wasm/src/lib.rs against a schema
-    dump — see scripts/README.md and scripts/check-modifier-values.ts.
 EOF
 }
 

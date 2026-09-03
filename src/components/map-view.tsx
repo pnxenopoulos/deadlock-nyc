@@ -2,6 +2,7 @@ import * as React from "react";
 import {
   Amphora,
   Castle,
+  CircleDollarSign,
   Crosshair,
   Crown,
   Flag,
@@ -9,6 +10,7 @@ import {
   type LucideIcon,
   Maximize,
   Orbit,
+  PackageOpen,
   Shield,
   ShieldHalf,
   Skull,
@@ -27,42 +29,9 @@ import {
   TooltipTrigger,
 } from "@/components/ui/tooltip";
 import { assetUrl, cn } from "@/lib/utils";
-import type { FrameStore } from "@/wasm/frames";
+import type { FrameStore, PositionFrame } from "@/wasm/frames";
 
-export interface PlayerPosition {
-  slot: number;
-  team: number;
-  hero_id: number;
-  alive: boolean;
-  x: number;
-  y: number;
-  /** World height of the body origin. z < 0 = underground (tunnels layer);
-   * z >= 0 = surface. */
-  z: number;
-  /** Look angles (deg): yaw = horizontal facing (0 = +X/east, CCW); pitch
-   * wraps 0..360 (small/near-360 = level, ~90 = looking down). */
-  yaw: number;
-  pitch: number;
-  health: number;
-  max_health: number;
-  /** Current damage-absorbing barrier remaining; zero when unavailable. */
-  barrier: number;
-  net_worth: number;
-  ap_net_worth: number;
-  kills: number;
-  deaths: number;
-  assists: number;
-  hero_damage: number;
-  hero_healing: number;
-  /** Cumulative damage dealt to objectives (towers, walkers, patron, …). */
-  objective_damage: number;
-  bonus_health: number;
-  spirit_power: number;
-  fire_rate: number;
-  weapon_damage: number;
-  cooldown_reduction: number;
-  ammo: number;
-}
+export type { PlayerPosition, PositionFrame } from "@/wasm/frames";
 
 /** A hero's signature ability (constant for the match). */
 export interface AbilitySlot {
@@ -101,37 +70,14 @@ export interface AbilityTick {
   charge_recharge_end: number;
 }
 
-export interface PositionFrame {
-  tick: number;
-  // Active (non-paused) ticks elapsed at this frame — the regulation clock.
-  reg_ticks: number;
-  players: PlayerPosition[];
-  // Alive lane troopers, packed by pack_trooper in the parser (see map render).
-  troopers: number[];
-  // Live urn (Idol) world positions, flat [x0, y0, x1, y1, …].
-  urns: number[];
-}
-
 export interface PauseInterval {
   start: number;
   end: number;
 }
 
-export interface ResolvedPaths {
-  vec_x?: string;
-  vec_y?: string;
-  vec_z?: string;
-  cell_x?: string;
-  cell_y?: string;
-  cell_z?: string;
-  team?: string;
-  life?: string;
-}
-
 export interface PositionsResult {
   game_mode: number;
   match_mode: number;
-  paths: ResolvedPaths;
   frames: FrameStore;
   item_events: ItemEvent[];
   kill_events: KillEvent[];
@@ -145,6 +91,8 @@ export interface PositionsResult {
   objective_health: ObjectiveHealthEvent[];
   neutral_camps: NeutralCamp[];
   camp_state_events: CampStateEvent[];
+  breakable_events: BreakableEvent[];
+  sinner_events: SinnerEvent[];
   chat_events: ChatEvent[];
   modifier_spans: ModifierSpan[];
   pause_intervals: PauseInterval[];
@@ -159,12 +107,16 @@ export interface PositionsResult {
  * modifier's own `modifier_name` is a secondary label. Either name may be empty
  * but never both. `caster_hero_id` is the applying hero (0 = none / non-player),
  * `duration` is in seconds (-1 = indefinite), and `applied_reg_tick` anchors
- * the timer in non-paused match ticks.
+ * the timer in non-paused match ticks. `end_reg_tick` is the recorded removal
+ * time in the same clock (null if still active when the recording ends).
  */
 export interface ModifierSpan {
+  serial: number;
+  modifier_id: number;
   hero_id: number;
   start_tick: number;
   end_tick: number | null;
+  end_reg_tick: number | null;
   applied_reg_tick: number;
   ability_id: number;
   ability_name: string;
@@ -195,6 +147,34 @@ export interface NeutralCampState {
   y: number;
   size: number;
   up: boolean;
+}
+
+export interface BreakableEvent {
+  tick: number;
+  id: number;
+  serial: number;
+  subclass_name: string;
+  team: number;
+  x: number;
+  y: number;
+  z: number;
+}
+
+export interface SinnerEvent {
+  tick: number;
+  event: "spawned" | "hit" | "reset";
+  id: number;
+  serial: number;
+  health: number;
+  max_health: number;
+  damage: number;
+  x: number;
+  y: number;
+  z: number;
+}
+
+export interface SinnerMachineState extends SinnerEvent {
+  hit: boolean;
 }
 
 /**
@@ -376,6 +356,8 @@ const CARET_HALF_W = 260;
 
 // Neutral (gold) accent for jungle camp chevrons.
 const NEUTRAL_CAMP_COLOR = "#e0b84a";
+const BREAKABLE_COLOR = "#fb923c";
+const SINNER_COLOR = "#facc15";
 
 // Warm muzzle-flash palette for the gunfire overlay — deliberately off the team
 // colors so a firing hero reads as "shooting" regardless of side.
@@ -402,6 +384,8 @@ type LayerKey =
   | "gunfire"
   | "troopers"
   | "neutrals"
+  | "breakables"
+  | "sinners"
   | "objectives"
   | "urn";
 type Layers = Record<LayerKey, boolean>;
@@ -431,6 +415,18 @@ const LAYER_TOGGLES: {
     desc: "Neutral jungle camps — chevrons mark camp size",
   },
   {
+    key: "breakables",
+    label: "Breakables",
+    Icon: PackageOpen,
+    desc: "Recently broken crates, statues, and street props",
+  },
+  {
+    key: "sinners",
+    label: "Sinners",
+    Icon: CircleDollarSign,
+    desc: "Sinner's Sacrifice machines and their current health",
+  },
+  {
     key: "objectives",
     label: "Objectives",
     Icon: Castle,
@@ -456,6 +452,15 @@ export const LAYERS: Record<MapLayer, { label: string; src: string }> = {
     src: "/minimap/minimap_midtown_mid_tunnels_psd.webp",
   },
 };
+
+function prettifyBreakable(name: string): string {
+  if (!name || name === "BREAKABLE_NOT_FOUND") return "Breakable prop";
+  return name
+    .replace(/^citadel_(?:breakable_)?(?:prop_)?/, "")
+    .replace(/_\d+$/, "")
+    .replaceAll("_", " ")
+    .replace(/\b\w/g, (letter) => letter.toUpperCase());
+}
 
 function teamColor(team: number) {
   return TEAM_COLORS[team] ?? "#888";
@@ -489,6 +494,8 @@ export function MapView({
   objectiveStates,
   rift,
   campStates,
+  breakableMarkers,
+  sinnerStates,
   firing,
   onSelectPlayer,
 }: {
@@ -500,6 +507,8 @@ export function MapView({
   objectiveStates?: ObjectiveState[];
   rift?: RiftState | null;
   campStates?: NeutralCampState[];
+  breakableMarkers?: BreakableEvent[];
+  sinnerStates?: SinnerMachineState[];
   /** hero_id → gun shots fired in the current frame's window (count > 0). */
   firing?: Map<number, number>;
   onSelectPlayer?: (heroId: number) => void;
@@ -510,6 +519,8 @@ export function MapView({
     gunfire: true,
     troopers: true,
     neutrals: true,
+    breakables: true,
+    sinners: true,
     objectives: true,
     urn: true,
   });
@@ -754,6 +765,85 @@ export function MapView({
                 </g>
               );
             })}
+            {layers.breakables &&
+              breakableMarkers?.map((event) => {
+                const onLayer = (event.z < Z_TUNNEL_CUTOFF) === (layer === "tunnels");
+                if (!onLayer) return null;
+                const radius = 230;
+                const label = prettifyBreakable(event.subclass_name);
+                return (
+                  <g
+                    key={`breakable-${event.id}-${event.serial}`}
+                    transform={`translate(${event.x - WORLD_MIN} ${WORLD_SIZE - (event.y - WORLD_MIN)}) scale(${1 / zoom})`}
+                  >
+                    <title>{`${label} broken`}</title>
+                    <circle
+                      r={radius}
+                      fill="rgba(12,14,22,0.82)"
+                      stroke={BREAKABLE_COLOR}
+                      strokeWidth={70}
+                    />
+                    <PackageOpen
+                      x={-radius * 0.55}
+                      y={-radius * 0.55}
+                      width={radius * 1.1}
+                      height={radius * 1.1}
+                      color="#fff"
+                      strokeWidth={2.4}
+                    />
+                  </g>
+                );
+              })}
+            {layers.sinners &&
+              sinnerStates?.map((machine) => {
+                const onLayer =
+                  (machine.z < Z_TUNNEL_CUTOFF) === (layer === "tunnels");
+                if (!onLayer) return null;
+                const radius = 290;
+                const ratio =
+                  machine.max_health > 0
+                    ? Math.max(0, Math.min(1, machine.health / machine.max_health))
+                    : 1;
+                const circumference = 2 * Math.PI * radius;
+                return (
+                  <g
+                    key={`sinner-${machine.id}-${machine.serial}`}
+                    transform={`translate(${machine.x - WORLD_MIN} ${WORLD_SIZE - (machine.y - WORLD_MIN)}) scale(${1 / zoom})`}
+                  >
+                    <title>{`Sinner's Sacrifice · ${machine.health}/${machine.max_health}${machine.damage ? ` · ${machine.damage} damage` : ""}`}</title>
+                    {machine.hit && (
+                      <circle
+                        r={radius + 150}
+                        fill={SINNER_COLOR}
+                        fillOpacity={0.2}
+                      />
+                    )}
+                    <circle r={radius} fill="rgba(12,14,22,0.84)" />
+                    <circle
+                      r={radius}
+                      fill="none"
+                      stroke="rgba(255,255,255,0.16)"
+                      strokeWidth={80}
+                    />
+                    <circle
+                      r={radius}
+                      fill="none"
+                      stroke={SINNER_COLOR}
+                      strokeWidth={80}
+                      strokeDasharray={`${ratio * circumference} ${circumference}`}
+                      transform="rotate(-90)"
+                    />
+                    <CircleDollarSign
+                      x={-radius * 0.55}
+                      y={-radius * 0.55}
+                      width={radius * 1.1}
+                      height={radius * 1.1}
+                      color="#fff"
+                      strokeWidth={2.4}
+                    />
+                  </g>
+                );
+              })}
             {/* Live objectives: icon + a partial ring showing health / max.
                 Drawn beneath the hero dots so heroes stay on top. */}
             {layers.objectives &&
