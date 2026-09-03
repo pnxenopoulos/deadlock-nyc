@@ -107,8 +107,7 @@ export interface PositionsResult {
  * modifier's own `modifier_name` is a secondary label. Either name may be empty
  * but never both. `caster_hero_id` is the applying hero (0 = none / non-player),
  * `duration` is in seconds (-1 = indefinite), and `applied_reg_tick` anchors
- * the timer in non-paused match ticks. `end_reg_tick` is the recorded removal
- * time in the same clock (null if still active when the recording ends).
+ * the timer in non-paused match ticks.
  */
 export interface ModifierSpan {
   serial: number;
@@ -116,7 +115,6 @@ export interface ModifierSpan {
   hero_id: number;
   start_tick: number;
   end_tick: number | null;
-  end_reg_tick: number | null;
   applied_reg_tick: number;
   ability_id: number;
   ability_name: string;

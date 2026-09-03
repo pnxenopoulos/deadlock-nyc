@@ -50,6 +50,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, dirname, join, relative, resolve, sep } from "node:path";
+import { findSource2ViewerCli, source2ViewerEnv } from "./source2viewer";
 
 const ROOT = resolve(import.meta.dir, "..");
 const PANORAMA = process.env.PANORAMA_DIR
@@ -123,15 +124,6 @@ async function haveCwebp(): Promise<boolean> {
   } catch {
     return false;
   }
-}
-
-function findSource2ViewerCli(): string | null {
-  if (process.env.SOURCE2VIEWER_CLI) return process.env.SOURCE2VIEWER_CLI;
-  return (
-    Bun.which("Source2Viewer-CLI") ??
-    Bun.which("Source2Viewer-CLI.exe") ??
-    Bun.which("source2viewer-cli")
-  );
 }
 
 function readManifestUrls(file: string): string[] {
@@ -260,7 +252,11 @@ async function encode(job: Job): Promise<number> {
     );
     const decompiler = Bun.spawn(
       [source2ViewerCli, "-i", job.source, "-o", requestedOutput],
-      { stdout: "ignore", stderr: "pipe" },
+      {
+        env: source2ViewerEnv(source2ViewerCli),
+        stdout: "ignore",
+        stderr: "pipe",
+      },
     );
     const code = await decompiler.exited;
     if (code !== 0 || !existsSync(decompiled)) {
@@ -330,8 +326,11 @@ function categoryOf(absDir: string): string {
 }
 
 async function main() {
-  if (!(await haveCwebp())) {
-    die("`cwebp` not found on PATH. Install it with `brew install webp`.");
+  if (!DRY_RUN && !(await haveCwebp())) {
+    die(
+      "`cwebp` not found on PATH. Install the WebP tools package " +
+        "(`sudo apt install webp` on Ubuntu or `brew install webp` on macOS).",
+    );
   }
   if (!existsSync(PANORAMA)) {
     die(`panorama dir not found: ${PANORAMA}\nExport images there with Source 2 Viewer, or set PANORAMA_DIR.`);
@@ -343,7 +342,7 @@ async function main() {
     !DRY_RUN &&
     jobs.some((job) => job.rankTier != null && needsEncode(job))
   ) {
-    source2ViewerCli = findSource2ViewerCli();
+    source2ViewerCli = findSource2ViewerCli(ROOT);
     if (!source2ViewerCli) {
       die(
         "rank textures need `Source2Viewer-CLI`; install ValveResourceFormat or set SOURCE2VIEWER_CLI.",

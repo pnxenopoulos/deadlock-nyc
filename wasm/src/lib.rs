@@ -1302,8 +1302,7 @@ impl DemoParser {
                     let serial = change.serial;
                     if change.kind == boon::ModifierChangeKind::Removed {
                         if let Some(open) = mod_open.remove(&serial) {
-                            modifier_spans
-                                .push(open.into_span(Some(ctx.tick()), Some(active_ticks)));
+                            modifier_spans.push(open.into_span(Some(ctx.tick())));
                         }
                         if let Some(pawn) = barrier_serial_pawn.remove(&serial)
                             && !barrier_serial_pawn.values().any(|other| *other == pawn)
@@ -1350,9 +1349,7 @@ impl DemoParser {
                             let visible_at_a_frame =
                                 last_emitted.is_some_and(|tick| open.start_tick <= tick);
                             if visible_at_a_frame {
-                                modifier_spans.push(
-                                    open.clone().into_span(Some(ctx.tick()), Some(active_ticks)),
-                                );
+                                modifier_spans.push(open.clone().into_span(Some(ctx.tick())));
                                 open.start_tick = ctx.tick();
                             }
                             next.start_tick = open.start_tick;
@@ -1846,9 +1843,8 @@ impl DemoParser {
         // Close any modifiers still active when the recording ended
         // (end_tick = None), then order spans by start for a stable feed.
         for (_, open) in mod_open {
-            modifier_spans.push(open.into_span(None, None));
+            modifier_spans.push(open.into_span(None));
         }
-        normalize_modifier_spans(&mut modifier_spans);
         modifier_spans.sort_by_key(|s| s.start_tick);
 
         let mut breakable_events: Vec<BreakableEvent> = breakable_pending
@@ -2286,14 +2282,13 @@ impl OpenModifier {
             && self.last_applied_time.to_bits() == other.last_applied_time.to_bits()
     }
 
-    fn into_span(self, end_tick: Option<i32>, end_reg_tick: Option<i32>) -> ModifierSpan {
+    fn into_span(self, end_tick: Option<i32>) -> ModifierSpan {
         ModifierSpan {
             serial: self.serial,
             modifier_id: self.modifier_id,
             hero_id: self.hero_id,
             start_tick: self.start_tick,
             end_tick,
-            end_reg_tick,
             applied_reg_tick: self.applied_reg_tick,
             ability_id: self.ability_id,
             ability_name: self.ability_name,
@@ -2308,9 +2303,7 @@ impl OpenModifier {
 /// One stable segment of a modifier's lifetime over [start_tick, end_tick).
 /// In-place refresh/stack/duration updates split a serial into adjacent segments
 /// so seeking reconstructs the values at that tick. `applied_reg_tick` is the
-/// most recent application in non-paused ticks and anchors the countdown;
-/// `end_reg_tick` is normalized to the serial's eventual removal tick, so the
-/// UI can show the recorded lifetime rather than assuming the base duration.
+/// most recent application in non-paused ticks and anchors the countdown.
 /// `duration` is seconds (-1 = indefinite).
 #[derive(Serialize)]
 struct ModifierSpan {
@@ -2319,7 +2312,6 @@ struct ModifierSpan {
     hero_id: i64,
     start_tick: i32,
     end_tick: Option<i32>,
-    end_reg_tick: Option<i32>,
     applied_reg_tick: i32,
     ability_id: u32,
     ability_name: String,
@@ -2327,24 +2319,6 @@ struct ModifierSpan {
     caster_hero_id: i64,
     stacks: i32,
     duration: f32,
-}
-
-/// Propagate a serial's eventual removal time to every stable segment. Changes
-/// such as stack or duration refreshes split one lifecycle into adjacent spans,
-/// but each segment should display the same observed end time.
-fn normalize_modifier_spans(spans: &mut [ModifierSpan]) {
-    let mut final_segments: HashMap<u32, (i32, Option<i32>)> = HashMap::new();
-    for span in spans.iter() {
-        let final_segment = final_segments
-            .entry(span.serial)
-            .or_insert((span.start_tick, span.end_reg_tick));
-        if span.start_tick >= final_segment.0 {
-            *final_segment = (span.start_tick, span.end_reg_tick);
-        }
-    }
-    for span in spans {
-        span.end_reg_tick = final_segments[&span.serial].1;
-    }
 }
 
 #[derive(Clone, Copy)]
@@ -2824,9 +2798,7 @@ fn to_js_error(e: boon::Error) -> JsError {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        AbilitySlot, ModifierSpan, normalize_modifier_spans, should_replace_ability_slots,
-    };
+    use super::{AbilitySlot, should_replace_ability_slots};
 
     fn slots(ids: &[u32]) -> Vec<AbilitySlot> {
         ids.iter()
@@ -2843,38 +2815,5 @@ mod tests {
         let geist = slots(&[5, 6, 7, 8]);
         assert!(should_replace_ability_slots(Some(&werewolf), &geist));
         assert!(!should_replace_ability_slots(Some(&geist), &geist));
-    }
-
-    fn modifier_span(serial: u32, start_tick: i32, end_reg_tick: Option<i32>) -> ModifierSpan {
-        ModifierSpan {
-            serial,
-            modifier_id: 1,
-            hero_id: 67,
-            start_tick,
-            end_tick: end_reg_tick,
-            end_reg_tick,
-            applied_reg_tick: 0,
-            ability_id: 2_521_902_222,
-            ability_name: "citadel_ability_sticky_bomb".to_string(),
-            modifier_name: String::new(),
-            caster_hero_id: 15,
-            stacks: 1,
-            duration: 3.5,
-        }
-    }
-
-    #[test]
-    fn propagates_modifier_lifecycle_end_to_each_segment() {
-        let mut spans = vec![
-            modifier_span(666, 100, Some(180)),
-            modifier_span(666, 180, Some(640)),
-            modifier_span(667, 200, None),
-        ];
-
-        normalize_modifier_spans(&mut spans);
-
-        assert_eq!(spans[0].end_reg_tick, Some(640));
-        assert_eq!(spans[1].end_reg_tick, Some(640));
-        assert_eq!(spans[2].end_reg_tick, None);
     }
 }

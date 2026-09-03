@@ -1,8 +1,26 @@
 # Updating game data
 
 deadlock-nyc renders game-derived item and ability icons, hero portraits,
-competitive rank badges, and the player stat panel (modifiers). Each has a
-different update path. After a Deadlock patch, work through the tiers below.
+competitive rank badges, and the player stat panel.
+
+## One-command refresh
+
+On the WSL development machine, run:
+
+```bash
+bun run refresh
+```
+
+This pulls the latest GameTracking data, extracts only referenced images from
+the installed Windows game, optimizes them, rebuilds the Boon WASM module, and
+verifies the production build. It auto-detects the current local paths:
+
+- Source 2 Viewer: `../cli-linux-x64/Source2Viewer-CLI`
+- Deadlock: Windows Steam libraries mounted under `/mnt/<drive>/`
+
+Override either with `SOURCE2VIEWER_CLI=/path/to/Source2Viewer-CLI` or
+`DEADLOCK_VPK=/path/to/pak01_dir.vpk`. Set `SOURCE2VIEWER_THREADS` to change
+the extraction concurrency.
 
 ## What lives where
 
@@ -16,8 +34,7 @@ different update path. After a Deadlock patch, work through the tiers below.
 | Ability/item-active **icon paths** (name → `.webp`) | `abilities.vdata` `m_strAbilityImage` | `bun run sync` → `src/data/ability-icons.json` |
 | Ability **display names** (internal id → in-game English) | `citadel_heroes_english.txt` + `citadel_gc_mod_names_english.txt` | `bun run sync` → `src/data/ability-names.json` |
 | Competitive **rank badges** (packed rank → tier `.webp`) | `panorama/images/ranked/badges/rankXX_lg_psd.vtex_c` | `bun run images` → `public/ranks/` + `src/data/rank-icons.json` |
-| Item / hero / ability / minimap **images** | game VPKs | Source 2 Viewer export → `panorama/`, then `bun run images` → `public/` |
-| Modifier **stat-type ids** (`m_eValType`) | `EModifierValue` schema enum | `wasm/src/lib.rs` + `bun run check-modifiers` |
+| Item / hero / ability / minimap **images** | game VPKs | `bun run extract-images`, then `bun run images` → `public/` |
 
 ## Tier 1 — pull from GameTracking (runs anywhere)
 
@@ -49,23 +66,26 @@ read `scripts/.vdata/`).
 
 ## Tier 2 — needs the Deadlock machine + Source 2 Viewer
 
-GameTracking ships scripts/vdata, not images or schema enums. These steps run
-on a machine with Deadlock installed.
+GameTracking does not ship images. These steps run on a machine with Deadlock
+installed and require Source 2 Viewer plus `cwebp` (Ubuntu:
+`sudo apt install webp`; macOS: `brew install webp`).
 
 ### Images
 
-Export the panorama image tree with Source 2 Viewer at the **same game build**
-you synced, into `panorama/images/` at the repo root (gitignored — it's the full
-multi-MB dump). Source 2 Viewer names exports by source extension —
-`inferno_sm.psd` → `inferno_sm_psd.png` — which is exactly the convention the
-manifests encode, so matching builds line up automatically.
-
-Then extract just what the app serves and optimize it:
+`extract-game-images.ts` reads the generated manifests and asks Source 2
+Viewer for only the referenced textures. On WSL it reads the Windows VPK
+directly through `/mnt/<drive>/`; no game copy or Windows CLI is needed. It
+writes decompiled PNGs to the gitignored `panorama/images/` tree and retains
+compiled rank textures for the rank pipeline.
 
 ```bash
-bun run images          # panorama/images/ -> public/{items,heroes,minimap}/*.webp
-bun run images --dry-run   # preview what would be written/pruned
+bun run extract-images
+bun run images --dry-run
+bun run images
 ```
+
+`bun run extract-images` and `bun run images` are the image-only workflow.
+`bun run refresh` also refreshes manifests, WASM, and the production build.
 
 `build-images.ts` reads the set the app references (the `item-icons.json`,
 `hero-portraits.json`, and `ability-icons.json` values plus the two minimap
@@ -78,7 +98,7 @@ didn't produce, so the shipped tree (`public/{items,heroes,minimap,hud,upgrades,
 deployed; hand-authored files outside those dirs (`public/hud/golden_idol.png`,
 `public/teams/*.svg`) are never touched. The first run also replaces the legacy
 whole-dump symlinks (`public/items -> deadlock-images/…`) with real directories;
-the dumps behind them are left untouched. Needs `cwebp` (`brew install webp`).
+the dumps behind them are left untouched.
 
 Rank textures are compiled `.vtex_c` resources, so that part also needs the
 ValveResourceFormat command-line tool as `Source2Viewer-CLI` on `PATH` (or set
@@ -87,33 +107,18 @@ temporary PNG before WebP encoding. All six subdivisions share their tier's
 badge: `rank06_lg_psd.vtex_c` becomes `public/ranks/06.webp`, and packed ranks
 `61` through `66` all map to that URL in `src/data/rank-icons.json`.
 
-### Modifiers (stat panel)
-
-The stat-viewer ids (`31 → bonus_health`, …) are `EModifierValue` enum values,
-absent from GameTracking and boon-proto. To verify them after a patch, dump the
-`EModifierValue` enum (Source 2 Viewer schema export, or a source2gen dump) to
-`scripts/.vdata/EModifierValue.txt`, then:
-
-```bash
-bun run check-modifiers
-```
-
-It reports whether each id in `wasm/src/lib.rs` still names the stat we expect,
-and lists candidate ids if one moved. Fix the `match vt { … }` arms in
-`wasm/src/lib.rs`, then `bun run wasm`.
-
 ## Tier 3 — parser name tables (the `boon` crate)
 
 Hero names and the internal ability identifiers attached to demo events come
 from `boon::hero_name` / `boon::ability_name`. Refresh them in the `boon` repo
 (`scripts/sync-name-tables.sh`), publish, bump the version in `wasm/Cargo.toml`,
-and run `bun run wasm`. User-facing English ability labels are refreshed
-separately by `bun run sync` from Valve's localization files.
+and run `bun run wasm`. Boon 0.8 also owns modifier-value aliases through
+`decode_stat_modifier_value_type`. User-facing English ability labels are
+refreshed separately by `bun run sync` from Valve's localization files.
 
 ## Full post-patch checklist
 
-1. `DEADLOCK_REF=<patch> bun run sync` — item, ability, and portrait manifests.
-2. Re-export images at `<patch>`, retaining `panorama/images/ranked/badges/rankXX_lg_psd.vtex_c`, then `bun run images` (Deadlock machine).
-3. Dump `EModifierValue` and `bun run check-modifiers` (Deadlock machine).
-4. Bump `boon` if hero/ability names changed, then `bun run wasm`.
-5. `bun run dev` and spot-check a recent demo.
+1. Update the `boon` dependency if parser names or modifier aliases changed.
+2. Run `bun run refresh`.
+3. Review `git diff`, especially item tier costs after economy changes.
+4. Run `bun run dev` and spot-check a recent demo.

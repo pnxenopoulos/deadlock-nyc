@@ -28,6 +28,10 @@ import {
   TooltipContent,
   TooltipTrigger,
 } from "@/components/ui/tooltip";
+import {
+  collapseModifierRows,
+  type ModifierRow,
+} from "@/lib/modifier-rows";
 import { cn } from "@/lib/utils";
 import itemStats from "@/data/item-stats.json";
 
@@ -592,6 +596,7 @@ export function PlayerDetail({
               label="Status Res"
               value={stats?.status_resist ?? 0}
               complete={isComplete(stats, STAT_COMPLETE.statusResist)}
+              tooltip="Status Resistance reduces the duration of negative effects such as stuns, slows, silences, and roots. It does not reduce incoming damage."
               percent
             />
             <Bonus
@@ -733,18 +738,36 @@ function Bonus({
   value,
   percent,
   complete = true,
+  tooltip,
 }: {
   icon: React.ComponentType<{ className?: string }>;
   label: string;
   value: number;
   percent?: boolean;
   complete?: boolean;
+  tooltip?: string;
 }) {
   return (
     <div title={complete ? undefined : "Best-effort value; Boon does not have every contributing formula"}>
       <dt className="flex items-center gap-1 text-[10px] uppercase tracking-wide text-muted-foreground">
         <Icon className="size-3" />
-        {label}
+        {tooltip ? (
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <button
+                type="button"
+                className="cursor-help border-b border-dotted border-current leading-none"
+              >
+                {label}
+              </button>
+            </TooltipTrigger>
+            <TooltipContent className="max-w-64 normal-case tracking-normal">
+              {tooltip}
+            </TooltipContent>
+          </Tooltip>
+        ) : (
+          label
+        )}
       </dt>
       <dd className="text-sm font-medium tabular-nums">
         {!complete && "~"}
@@ -764,22 +787,6 @@ function formatBonus(value: number): string {
     abs >= 100 ? Math.round(value) : Math.round(value * 10) / 10;
   return rounded > 0 ? `+${rounded}` : `${rounded}`;
 }
-
-// One displayed row per live modifier serial.
-type ModRow = {
-  key: string;
-  abilityId: number;
-  abilityName: string;
-  label: string;
-  isItem: boolean;
-  casterHeroId: number;
-  /** Authoritative current in-game stack count. */
-  stacks: number;
-  /** Seconds left at the current tick; null = indefinite. */
-  remaining: number | null;
-  /** True if applied by a hero on the other team (incoming debuff). */
-  incoming: boolean;
-};
 
 // Reconstruct a readable label + icon hint from a span's source. Items are the
 // `upgrade_*` family (great icon + localized-name coverage); everything else is
@@ -819,20 +826,18 @@ function ModifierList({
   }, [players]);
 
   const rows = React.useMemo(() => {
-    return modifiers
-      .map((modifier): ModRow | null => {
+    const serialRows = modifiers
+      .map((modifier): ModifierRow | null => {
         const { label, isItem } = modifierLabel(modifier);
         if (!label) return null;
         const remaining =
-          modifier.end_reg_tick != null
-            ? Math.max(0, (modifier.end_reg_tick - regTick) / TICKS_PER_SECOND)
-            : modifier.duration > 0
-              ? Math.max(
-                  0,
-                  modifier.duration -
-                    (regTick - modifier.applied_reg_tick) / TICKS_PER_SECOND,
-                )
-              : null;
+          modifier.duration > 0
+            ? Math.max(
+                0,
+                modifier.duration -
+                  (regTick - modifier.applied_reg_tick) / TICKS_PER_SECOND,
+              )
+            : null;
         const casterTeam = heroById.get(modifier.caster_hero_id)?.team;
         return {
           key: `${modifier.serial}:${modifier.modifier_id}`,
@@ -850,7 +855,9 @@ function ModifierList({
             casterTeam !== selfTeam,
         };
       })
-      .filter((row): row is ModRow => row != null)
+      .filter((row): row is ModifierRow => row != null);
+
+    return collapseModifierRows(serialRows, selfHeroId)
       .sort((a, b) => {
         if (a.incoming !== b.incoming) return a.incoming ? -1 : 1;
         const remaining = (a.remaining ?? Infinity) - (b.remaining ?? Infinity);
