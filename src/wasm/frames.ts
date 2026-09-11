@@ -23,19 +23,17 @@ export interface PlayerPosition {
   hero_healing: number;
   /** Cumulative damage dealt to objectives. */
   objective_damage: number;
-  bonus_health: number;
-  spirit_power: number;
-  fire_rate: number;
-  weapon_damage: number;
-  cooldown_reduction: number;
-  ammo: number;
-  bullet_resist: number;
-  spirit_resist: number;
-  status_resist: number;
-  bullet_lifesteal: number;
-  spirit_lifesteal: number;
-  /** Boon StatId completeness bits; unset values are best-effort estimates. */
-  stat_complete_mask: number;
+  /** Persistent stat-modifier contributions recorded by the demo. */
+  stat_modifier_health: number;
+  stat_modifier_spirit_power: number;
+  stat_modifier_fire_rate: number;
+  stat_modifier_weapon_damage: number;
+  stat_modifier_cooldown_reduction: number;
+  stat_modifier_ammo: number;
+  stat_modifier_bullet_resist: number;
+  stat_modifier_spirit_resist: number;
+  stat_modifier_values_available: boolean;
+  unknown_stat_modifier_count: number;
 }
 
 export interface PositionFrame {
@@ -63,8 +61,8 @@ export interface PackedFrameData {
   urns: Float32Array;
 }
 
-const PLAYER_I32_STRIDE = 15;
-const PLAYER_F32_STRIDE = 17;
+const PLAYER_I32_STRIDE = 16;
+const PLAYER_F32_STRIDE = 14;
 
 /** Compact, transferable storage for sampled frames.
  *
@@ -183,19 +181,17 @@ export class FrameStore {
       hero_damage: this.packed.player_i32[ii + 11],
       hero_healing: this.packed.player_i32[ii + 12],
       objective_damage: this.packed.player_i32[ii + 13],
-      stat_complete_mask: this.packed.player_i32[ii + 14],
-      bonus_health: this.packed.player_f32[fi + 5],
-      spirit_power: this.packed.player_f32[fi + 6],
-      fire_rate: this.packed.player_f32[fi + 7],
-      weapon_damage: this.packed.player_f32[fi + 8],
-      cooldown_reduction: this.packed.player_f32[fi + 9],
-      ammo: this.packed.player_f32[fi + 10],
+      stat_modifier_values_available: this.packed.player_i32[ii + 14] !== 0,
+      unknown_stat_modifier_count: this.packed.player_i32[ii + 15],
+      stat_modifier_health: this.packed.player_f32[fi + 5],
+      stat_modifier_spirit_power: this.packed.player_f32[fi + 6],
+      stat_modifier_fire_rate: this.packed.player_f32[fi + 7],
+      stat_modifier_weapon_damage: this.packed.player_f32[fi + 8],
+      stat_modifier_cooldown_reduction: this.packed.player_f32[fi + 9],
+      stat_modifier_ammo: this.packed.player_f32[fi + 10],
       barrier: this.packed.player_f32[fi + 11],
-      bullet_resist: this.packed.player_f32[fi + 12],
-      spirit_resist: this.packed.player_f32[fi + 13],
-      status_resist: this.packed.player_f32[fi + 14],
-      bullet_lifesteal: this.packed.player_f32[fi + 15],
-      spirit_lifesteal: this.packed.player_f32[fi + 16],
+      stat_modifier_bullet_resist: this.packed.player_f32[fi + 12],
+      stat_modifier_spirit_resist: this.packed.player_f32[fi + 13],
     };
   }
 

@@ -2,8 +2,6 @@ import * as React from "react";
 import {
   ChevronDown,
   ChevronLeft,
-  Droplet,
-  HeartPulse,
   Shield,
   ShieldHalf,
 } from "lucide-react";
@@ -169,21 +167,6 @@ const ABILITY_PIXELS = 36;
 // Abilities have three upgrade tiers; we render one segment per tier.
 const ABILITY_TIERS = 3;
 const TICKS_PER_SECOND = 64;
-const STAT_COMPLETE = {
-  bulletResist: 1 << 0,
-  spiritResist: 1 << 1,
-  spiritPower: 1 << 2,
-  fireRate: 1 << 3,
-  weaponDamage: 1 << 4,
-  cooldownReduction: 1 << 5,
-  statusResist: 1 << 6,
-  bulletLifesteal: 1 << 7,
-  spiritLifesteal: 1 << 8,
-} as const;
-
-function isComplete(stats: PlayerPosition | undefined, bit: number): boolean {
-  return stats == null || (stats.stat_complete_mask & bit) !== 0;
-}
 
 /** One reconstructed cooldown period for an ability, in absolute ticks. */
 export type CooldownSpan = {
@@ -288,6 +271,9 @@ export function PlayerDetail({
   const portrait = heroPortraitUrl(player.hero_id);
   const teamLabel = TEAM_NAMES[player.team] ?? `Team ${player.team}`;
   const teamColor = TEAM_COLORS[player.team] ?? "#888";
+  const statModifiersAvailable = stats?.stat_modifier_values_available ?? false;
+  const unknownStatModifiers = stats?.unknown_stat_modifier_count ?? 0;
+  const statModifiersComplete = unknownStatModifiers === 0;
 
   // Pad to a fixed 10-slot inventory so empty slots stay visible.
   const slots = (items?.items ?? []).slice(0, SLOT_COUNT);
@@ -537,80 +523,78 @@ export function PlayerDetail({
           </div>
         </CollapsibleSection>
 
-        <CollapsibleSection title="Bonuses">
+        <CollapsibleSection title="Recorded bonuses">
+          <p className="mb-2 text-[10px] leading-relaxed text-muted-foreground">
+            Persistent modifier contributions recorded in the replay. These do
+            not include base hero stats or every dynamic ability effect.
+            {unknownStatModifiers > 0 && (
+              <>
+                {" "}~ marks totals that may omit {unknownStatModifiers}{" "}
+                unrecognized modifier{unknownStatModifiers === 1 ? "" : "s"}.
+              </>
+            )}
+          </p>
           <dl className="grid grid-cols-3 gap-x-3 gap-y-2">
             <Bonus
               icon={HealthIcon}
-              label="Bonus HP"
-              value={stats?.bonus_health ?? 0}
+              label="Health"
+              value={stats?.stat_modifier_health ?? 0}
+              available={statModifiersAvailable}
+              complete={statModifiersComplete}
             />
             <Bonus
               icon={WeaponDamageIcon}
               label="Weapon DMG"
-              value={stats?.weapon_damage ?? 0}
-              complete={isComplete(stats, STAT_COMPLETE.weaponDamage)}
+              value={stats?.stat_modifier_weapon_damage ?? 0}
+              available={statModifiersAvailable}
+              complete={statModifiersComplete}
               percent
             />
             <Bonus
               icon={SpiritIcon}
               label="Spirit"
-              value={stats?.spirit_power ?? 0}
-              complete={isComplete(stats, STAT_COMPLETE.spiritPower)}
+              value={stats?.stat_modifier_spirit_power ?? 0}
+              available={statModifiersAvailable}
+              complete={statModifiersComplete}
             />
             <Bonus
               icon={FireRateIcon}
               label="Fire Rate"
-              value={stats?.fire_rate ?? 0}
-              complete={isComplete(stats, STAT_COMPLETE.fireRate)}
+              value={stats?.stat_modifier_fire_rate ?? 0}
+              available={statModifiersAvailable}
+              complete={statModifiersComplete}
               percent
             />
             <Bonus
               icon={CooldownIcon}
               label="CDR"
-              value={stats?.cooldown_reduction ?? 0}
-              complete={isComplete(stats, STAT_COMPLETE.cooldownReduction)}
+              value={stats?.stat_modifier_cooldown_reduction ?? 0}
+              available={statModifiersAvailable}
+              complete={statModifiersComplete}
               percent
             />
             <Bonus
               icon={AmmoIcon}
               label="Ammo"
-              value={stats?.ammo ?? 0}
+              value={stats?.stat_modifier_ammo ?? 0}
+              available={statModifiersAvailable}
+              complete={statModifiersComplete}
               percent
             />
             <Bonus
               icon={Shield}
               label="Bullet Res"
-              value={stats?.bullet_resist ?? 0}
-              complete={isComplete(stats, STAT_COMPLETE.bulletResist)}
+              value={stats?.stat_modifier_bullet_resist ?? 0}
+              available={statModifiersAvailable}
+              complete={statModifiersComplete}
               percent
             />
             <Bonus
               icon={ShieldHalf}
               label="Spirit Res"
-              value={stats?.spirit_resist ?? 0}
-              complete={isComplete(stats, STAT_COMPLETE.spiritResist)}
-              percent
-            />
-            <Bonus
-              icon={HeartPulse}
-              label="Status Res"
-              value={stats?.status_resist ?? 0}
-              complete={isComplete(stats, STAT_COMPLETE.statusResist)}
-              tooltip="Status Resistance reduces the duration of negative effects such as stuns, slows, silences, and roots. It does not reduce incoming damage."
-              percent
-            />
-            <Bonus
-              icon={Droplet}
-              label="Bullet Lifesteal"
-              value={stats?.bullet_lifesteal ?? 0}
-              complete={isComplete(stats, STAT_COMPLETE.bulletLifesteal)}
-              percent
-            />
-            <Bonus
-              icon={Droplet}
-              label="Spirit Lifesteal"
-              value={stats?.spirit_lifesteal ?? 0}
-              complete={isComplete(stats, STAT_COMPLETE.spiritLifesteal)}
+              value={stats?.stat_modifier_spirit_resist ?? 0}
+              available={statModifiersAvailable}
+              complete={statModifiersComplete}
               percent
             />
           </dl>
@@ -737,42 +721,37 @@ function Bonus({
   label,
   value,
   percent,
+  available = true,
   complete = true,
-  tooltip,
 }: {
   icon: React.ComponentType<{ className?: string }>;
   label: string;
   value: number;
   percent?: boolean;
+  available?: boolean;
   complete?: boolean;
-  tooltip?: string;
 }) {
+  const title = !available
+    ? "This replay does not expose recorded stat-modifier values"
+    : !complete
+      ? "The replay contains an unrecognized stat-modifier type"
+      : undefined;
   return (
-    <div title={complete ? undefined : "Best-effort value; Boon does not have every contributing formula"}>
+    <div title={title}>
       <dt className="flex items-center gap-1 text-[10px] uppercase tracking-wide text-muted-foreground">
         <Icon className="size-3" />
-        {tooltip ? (
-          <Tooltip>
-            <TooltipTrigger asChild>
-              <button
-                type="button"
-                className="cursor-help border-b border-dotted border-current leading-none"
-              >
-                {label}
-              </button>
-            </TooltipTrigger>
-            <TooltipContent className="max-w-64 normal-case tracking-normal">
-              {tooltip}
-            </TooltipContent>
-          </Tooltip>
-        ) : (
-          label
-        )}
+        {label}
       </dt>
       <dd className="text-sm font-medium tabular-nums">
-        {!complete && "~"}
-        {formatBonus(value)}
-        {percent ? "%" : ""}
+        {!available ? (
+          "—"
+        ) : (
+          <>
+            {!complete && "~"}
+            {formatBonus(value)}
+            {percent ? "%" : ""}
+          </>
+        )}
       </dd>
     </div>
   );

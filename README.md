@@ -48,7 +48,7 @@ and renders the parsed entities, events, and stats in the browser.
 
 ## Performance and memory
 
-The WASM adapter uses boon 0.8 and pbdems2 0.3. It requests only the event
+The WASM adapter uses boon 0.9 and pbdems2 0.3. It requests only the event
 types used by the UI and uses boon's changed-entity indices for roster and
 objective updates instead of rescanning every live entity each tick.
 

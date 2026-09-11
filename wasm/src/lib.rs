@@ -18,6 +18,7 @@ const PAWN_CLASS: &str = "CCitadelPlayerPawn";
 const CONTROLLER_CLASS: &str = "CCitadelPlayerController";
 const GAMERULES_CLASS: &str = "CCitadelGameRulesProxy";
 const BARRIER_TRACKER_MODIFIER_ID: u32 = 4_267_845_006;
+const RESTAMP_MIN_REAPPLY_HEROES: usize = 6;
 const BREAKABLE_CLASS: &str = "CCitadel_BreakableProp";
 const SINNER_CLASSES: &[&str] = &[
     "CNPC_Neutral_SinnersSacrifice",
@@ -78,7 +79,6 @@ const URN_CARRY_MAX_TICKS: i32 = 90 * 64;
 const SIGNATURE_ABILITY_SLOTS: usize = 4;
 
 const ABILITY_UPGRADE_SLOTS: usize = 8;
-const UPGRADE_SLOTS: usize = 16;
 /// The game clears the Rift location to FLT_MAX when it resolves. This sanity
 /// bound rejects that finite sentinel and any other implausible map coordinate.
 const RIFT_COORD_SANITY: f32 = 1.0e6;
@@ -453,6 +453,7 @@ impl DemoParser {
         let mut pk_life: Option<u64> = None;
         let mut pk_health: Option<u64> = None;
         let mut pk_max_health: Option<u64> = None;
+        let mut pk_simulation_time: Option<u64> = None;
         // m_angEyeAngles: QAngle(pitch, yaw, roll) — the hero's look direction.
         let mut pk_eye: Option<u64> = None;
 
@@ -471,13 +472,10 @@ impl DemoParser {
         let mut ck_healing: Option<u64> = None;
         let mut ck_objective_damage: Option<u64> = None;
         let mut ck_health_max: Option<u64> = None;
-        let mut ck_pawn: Option<u64> = None;
         // (eValType key, value key) pairs for the 20 stat-modifier slots on
         // m_PlayerDataGlobal.m_vecStatViewerModifierValues.
+        let mut ck_stat_count: Option<u64> = None;
         let mut ck_stat_keys: Vec<(Option<u64>, Option<u64>)> = Vec::with_capacity(20);
-        let mut ck_level: Option<u64> = None;
-        let mut ck_upgrade_count: Option<u64> = None;
-        let mut ck_upgrade_keys = [None; UPGRADE_SLOTS];
         // (m_ItemID key, m_nUpgradeInfo key) pairs for the four signature slots
         // on m_PlayerDataGlobal.m_vecAbilityUpgradeState.
         let mut ck_ability_keys: Vec<(Option<u64>, Option<u64>)> =
@@ -613,9 +611,12 @@ impl DemoParser {
         // than the modifier's own subclass) with the modifier's own name as a
         // secondary label; spans that resolve to neither are dropped. Reading
         // the string table is independent of the entity class filter.
-        let mut modifier_state = boon::ModifierState::default();
+        let mut modifier_state = boon::EffectiveModifierState::default();
+        let mut barrier_modifier_state = boon::ModifierState::default();
         let mut mod_open: HashMap<u32, OpenModifier> = HashMap::new();
         let mut modifier_spans: Vec<ModifierSpan> = Vec::new();
+        let mut modifier_seen: HashSet<(i64, u32)> = HashSet::new();
+        let mut suppressed_modifier_serials: HashSet<u32> = HashSet::new();
         // Barrier is not a pawn send-table field. Its persistent tracker uses
         // float1 for capacity and float2 for current remaining barrier.
         let mut barrier_by_pawn: HashMap<i32, f32> = HashMap::new();
@@ -904,6 +905,7 @@ impl DemoParser {
                     pk_life = s.resolve_field_key("m_lifeState");
                     pk_health = s.resolve_field_key("m_iHealth");
                     pk_max_health = s.resolve_field_key("m_iMaxHealth");
+                    pk_simulation_time = s.resolve_field_key("m_flSimulationTime");
                     pk_eye = s.resolve_field_key("m_angEyeAngles");
                     pawn_keys_resolved = true;
                 }
@@ -927,12 +929,8 @@ impl DemoParser {
                     // controller's m_iHealthMax already folds in level growth,
                     // items and buffs, so it's the correct denominator.
                     ck_health_max = s.resolve_field_key("m_PlayerDataGlobal.m_iHealthMax");
-                    ck_pawn = s.resolve_field_key("m_hPawn");
-                    ck_level = s.resolve_field_key("m_PlayerDataGlobal.m_iLevel");
-                    ck_upgrade_count = s.resolve_field_key("m_PlayerDataGlobal.m_vecUpgrades");
-                    ck_upgrade_keys = std::array::from_fn(|i| {
-                        s.resolve_field_key(&format!("m_PlayerDataGlobal.m_vecUpgrades.{i}"))
-                    });
+                    ck_stat_count =
+                        s.resolve_field_key("m_PlayerDataGlobal.m_vecStatViewerModifierValues");
                     for i in 0..20usize {
                         let vt = s.resolve_field_key(&format!(
                             "m_PlayerDataGlobal.m_vecStatViewerModifierValues.{i}.m_eValType"
@@ -1296,14 +1294,11 @@ impl DemoParser {
                     }
                 }
 
-                // Boon merges partial ActiveModifiers protobufs and reports
-                // applied/changed/removed lifecycles with complete entries.
-                for change in modifier_state.update(ctx) {
+                // Barrier reflects the raw replicated table: its tracker uses
+                // float2 and is explicitly removed by the game.
+                for change in barrier_modifier_state.update(ctx) {
                     let serial = change.serial;
                     if change.kind == boon::ModifierChangeKind::Removed {
-                        if let Some(open) = mod_open.remove(&serial) {
-                            modifier_spans.push(open.into_span(Some(ctx.tick())));
-                        }
                         if let Some(pawn) = barrier_serial_pawn.remove(&serial)
                             && !barrier_serial_pawn.values().any(|other| *other == pawn)
                         {
@@ -1332,7 +1327,66 @@ impl DemoParser {
                             barrier_by_pawn.remove(&old_pawn);
                         }
                     }
+                }
 
+                // Boon's effective state merges partial ActiveModifiers rows,
+                // honors aura exits, and expires finite modifiers against the
+                // Source 2 simulation clock even if Valve leaves a stale row.
+                let changes =
+                    modifier_state.update(ctx, current_simulation_time(ctx, pk_simulation_time));
+
+                // Some demo keyframes restamp many already-seen modifiers at
+                // the same tick. Match boon-python's conservative filter so
+                // those bookkeeping snapshots do not become duplicate UI rows.
+                let restamped_heroes: HashSet<i64> = changes
+                    .iter()
+                    .filter(|change| change.kind == boon::ModifierChangeKind::Applied)
+                    .filter_map(|change| {
+                        let modifier_id = change.entry.modifier_subclass?;
+                        let pawn = boon::protobuf_handle_index(change.entry.parent)?;
+                        let hero_id = *pawn_to_hero.get(&pawn)?;
+                        modifier_seen
+                            .contains(&(hero_id, modifier_id))
+                            .then_some(hero_id)
+                    })
+                    .collect();
+                let is_restamp = restamped_heroes.len() >= RESTAMP_MIN_REAPPLY_HEROES;
+
+                for change in changes {
+                    let serial = change.serial;
+                    if change.kind == boon::ModifierChangeKind::Removed {
+                        suppressed_modifier_serials.remove(&serial);
+                        if let Some(open) = mod_open.remove(&serial) {
+                            modifier_spans.push(open.into_span(Some(ctx.tick())));
+                        }
+                        continue;
+                    }
+
+                    let logical = change.entry.modifier_subclass.and_then(|modifier_id| {
+                        let pawn = boon::protobuf_handle_index(change.entry.parent)?;
+                        pawn_to_hero
+                            .get(&pawn)
+                            .map(|&hero_id| (hero_id, modifier_id))
+                    });
+                    if change.kind == boon::ModifierChangeKind::Applied {
+                        if is_restamp && logical.is_some_and(|key| modifier_seen.contains(&key)) {
+                            suppressed_modifier_serials.insert(serial);
+                            continue;
+                        }
+                        suppressed_modifier_serials.remove(&serial);
+                        if let Some(key) = logical {
+                            modifier_seen.insert(key);
+                        }
+                    } else if suppressed_modifier_serials.contains(&serial) {
+                        continue;
+                    }
+
+                    let m = &change.entry;
+                    // Barrier has its own numeric UI and its tracker is an
+                    // implementation detail, not a player-facing modifier.
+                    if m.modifier_subclass == Some(BARRIER_TRACKER_MODIFIER_ID) {
+                        continue;
+                    }
                     let Some(mut next) = OpenModifier::from_entry(
                         serial,
                         m,
@@ -1560,9 +1614,9 @@ impl DemoParser {
                     }
                 }
 
-                // Build the controller stats once per sampled frame. Boon owns
-                // the cross-build stat IDs, item catalog, hero progression,
-                // active-modifier formulas, and resistance stacking rules.
+                // Build the controller state once per sampled frame. Boon 0.9
+                // intentionally exposes only the modifier contributions that
+                // the demo records; these are not inferred total hero stats.
                 let mut stats_by_hero: HashMap<i64, PlayerStats> = HashMap::new();
                 if ctrl_keys_resolved {
                     for (_, entity) in ctx.entities().iter() {
@@ -1574,31 +1628,21 @@ impl DemoParser {
                             continue;
                         }
 
-                        let mut bonus_health = 0.0;
-                        let mut ammo = 0.0;
-                        for (value_type_key, value_key) in &ck_stat_keys {
-                            let Some(decoded) = boon::decode_stat_modifier_value_type(
-                                entity.get_u32(*value_type_key),
-                            ) else {
-                                continue;
-                            };
-                            let value = entity.get_f32(*value_key) * decoded.value_scale;
-                            match decoded.kind {
-                                boon::StatModifierKind::Health => bonus_health += value,
-                                boon::StatModifierKind::Ammo => ammo += value,
-                                _ => {}
-                            }
-                        }
-
-                        let upgrade_count = get_i64(entity, ck_upgrade_count)
-                            .clamp(0, UPGRADE_SLOTS as i64)
+                        let stat_modifier_values_available = ck_stat_count.is_some()
+                            && ck_stat_keys
+                                .iter()
+                                .any(|(kind, value)| kind.is_some() && value.is_some());
+                        let stat_count = get_i64(entity, ck_stat_count)
+                            .clamp(0, ck_stat_keys.len() as i64)
                             as usize;
-                        let upgrades: Vec<u32> = ck_upgrade_keys[..upgrade_count]
-                            .iter()
-                            .map(|key| entity.get_u32(*key))
-                            .filter(|id| *id != 0)
-                            .collect();
-                        let mut ability_tiers = HashMap::with_capacity(ABILITY_UPGRADE_SLOTS);
+                        let stat_modifiers = boon::aggregate_stat_modifier_values(
+                            ck_stat_keys.iter().take(stat_count).map(
+                                |(value_type_key, value_key)| {
+                                    (entity.get_u32(*value_type_key), entity.get_f32(*value_key))
+                                },
+                            ),
+                        );
+
                         let mut slots = Vec::with_capacity(SIGNATURE_ABILITY_SLOTS);
                         for (slot_idx, (item_key, bits_key)) in ck_ability_keys.iter().enumerate() {
                             let ability_id = entity.get_u32(*item_key);
@@ -1607,7 +1651,6 @@ impl DemoParser {
                             }
                             let level =
                                 (entity.get_u32(*bits_key) >> 17).count_ones().min(3) as i32;
-                            ability_tiers.insert(ability_id, level as u8);
                             if slot_idx >= SIGNATURE_ABILITY_SLOTS {
                                 continue;
                             }
@@ -1637,18 +1680,6 @@ impl DemoParser {
                             ability_slots.insert(hero_id, slots);
                         }
 
-                        let pawn_index = entity
-                            .get_handle(ck_pawn)
-                            .and_then(|handle| boon::protobuf_handle_index(Some(handle)));
-                        let layers = boon::evaluate_player_stats(
-                            hero_id,
-                            get_i64(entity, ck_level),
-                            &upgrades,
-                            &ability_tiers,
-                            modifier_state.entries().values().filter(|entry| {
-                                boon::protobuf_handle_index(entry.parent) == pawn_index
-                            }),
-                        );
                         stats_by_hero.insert(
                             hero_id,
                             PlayerStats {
@@ -1661,19 +1692,23 @@ impl DemoParser {
                                 hero_healing: get_i64(entity, ck_healing) as i32,
                                 objective_damage: get_i64(entity, ck_objective_damage) as i32,
                                 health_max: get_i64(entity, ck_health_max) as i32,
-                                bonus_health,
-                                spirit_power: layers.effective[boon::StatId::SpiritPower],
-                                fire_rate: layers.effective[boon::StatId::FireRateBonus],
-                                weapon_damage: layers.effective[boon::StatId::WeaponDamageBonus],
-                                cooldown_reduction: layers.effective
-                                    [boon::StatId::CooldownReduction],
-                                ammo,
-                                bullet_resist: layers.effective[boon::StatId::BulletResist],
-                                spirit_resist: layers.effective[boon::StatId::SpiritResist],
-                                status_resist: layers.effective[boon::StatId::StatusResist],
-                                bullet_lifesteal: layers.effective[boon::StatId::BulletLifesteal],
-                                spirit_lifesteal: layers.effective[boon::StatId::SpiritLifesteal],
-                                stat_complete_mask: stat_complete_mask(layers.complete),
+                                stat_modifier_health: stat_modifiers
+                                    [boon::StatModifierKind::Health],
+                                stat_modifier_spirit_power: stat_modifiers
+                                    [boon::StatModifierKind::SpiritPower],
+                                stat_modifier_fire_rate: stat_modifiers
+                                    [boon::StatModifierKind::FireRate],
+                                stat_modifier_weapon_damage: stat_modifiers
+                                    [boon::StatModifierKind::WeaponDamage],
+                                stat_modifier_cooldown_reduction: stat_modifiers
+                                    [boon::StatModifierKind::CooldownReduction],
+                                stat_modifier_ammo: stat_modifiers[boon::StatModifierKind::Ammo],
+                                stat_modifier_bullet_resist: stat_modifiers
+                                    [boon::StatModifierKind::BulletResist],
+                                stat_modifier_spirit_resist: stat_modifiers
+                                    [boon::StatModifierKind::SpiritResist],
+                                stat_modifier_values_available,
+                                unknown_stat_modifier_count: stat_modifiers.unknown_count as i32,
                             },
                         );
                     }
@@ -1736,18 +1771,16 @@ impl DemoParser {
                         hero_damage: stats.hero_damage,
                         hero_healing: stats.hero_healing,
                         objective_damage: stats.objective_damage,
-                        bonus_health: stats.bonus_health,
-                        spirit_power: stats.spirit_power,
-                        fire_rate: stats.fire_rate,
-                        weapon_damage: stats.weapon_damage,
-                        cooldown_reduction: stats.cooldown_reduction,
-                        ammo: stats.ammo,
-                        bullet_resist: stats.bullet_resist,
-                        spirit_resist: stats.spirit_resist,
-                        status_resist: stats.status_resist,
-                        bullet_lifesteal: stats.bullet_lifesteal,
-                        spirit_lifesteal: stats.spirit_lifesteal,
-                        stat_complete_mask: stats.stat_complete_mask,
+                        stat_modifier_health: stats.stat_modifier_health,
+                        stat_modifier_spirit_power: stats.stat_modifier_spirit_power,
+                        stat_modifier_fire_rate: stats.stat_modifier_fire_rate,
+                        stat_modifier_weapon_damage: stats.stat_modifier_weapon_damage,
+                        stat_modifier_cooldown_reduction: stats.stat_modifier_cooldown_reduction,
+                        stat_modifier_ammo: stats.stat_modifier_ammo,
+                        stat_modifier_bullet_resist: stats.stat_modifier_bullet_resist,
+                        stat_modifier_spirit_resist: stats.stat_modifier_spirit_resist,
+                        stat_modifier_values_available: stats.stat_modifier_values_available,
+                        unknown_stat_modifier_count: stats.unknown_stat_modifier_count,
                     });
                 }
 
@@ -2514,8 +2547,8 @@ struct PlayerInfo {
     rank: i64,
 }
 
-const PLAYER_I32_STRIDE: usize = 15;
-const PLAYER_F32_STRIDE: usize = 17;
+const PLAYER_I32_STRIDE: usize = 16;
+const PLAYER_F32_STRIDE: usize = 14;
 
 /// Columnar sampled-frame storage. Numeric typed arrays are both much smaller
 /// than nested JavaScript objects and transferable from the worker without a
@@ -2580,7 +2613,8 @@ impl PackedFrames {
                 player.hero_damage,
                 player.hero_healing,
                 player.objective_damage,
-                player.stat_complete_mask,
+                i32::from(player.stat_modifier_values_available),
+                player.unknown_stat_modifier_count,
             ]);
             self.player_f32.extend_from_slice(&[
                 player.x,
@@ -2588,18 +2622,15 @@ impl PackedFrames {
                 player.z,
                 player.yaw,
                 player.pitch,
-                player.bonus_health,
-                player.spirit_power,
-                player.fire_rate,
-                player.weapon_damage,
-                player.cooldown_reduction,
-                player.ammo,
+                player.stat_modifier_health,
+                player.stat_modifier_spirit_power,
+                player.stat_modifier_fire_rate,
+                player.stat_modifier_weapon_damage,
+                player.stat_modifier_cooldown_reduction,
+                player.stat_modifier_ammo,
                 player.barrier,
-                player.bullet_resist,
-                player.spirit_resist,
-                player.status_resist,
-                player.bullet_lifesteal,
-                player.spirit_lifesteal,
+                player.stat_modifier_bullet_resist,
+                player.stat_modifier_spirit_resist,
             ]);
         }
         self.player_offsets
@@ -2676,18 +2707,16 @@ struct PlayerPosition {
     hero_damage: i32,
     hero_healing: i32,
     objective_damage: i32,
-    bonus_health: f32,
-    spirit_power: f32,
-    fire_rate: f32,
-    weapon_damage: f32,
-    cooldown_reduction: f32,
-    ammo: f32,
-    bullet_resist: f32,
-    spirit_resist: f32,
-    status_resist: f32,
-    bullet_lifesteal: f32,
-    spirit_lifesteal: f32,
-    stat_complete_mask: i32,
+    stat_modifier_health: f32,
+    stat_modifier_spirit_power: f32,
+    stat_modifier_fire_rate: f32,
+    stat_modifier_weapon_damage: f32,
+    stat_modifier_cooldown_reduction: f32,
+    stat_modifier_ammo: f32,
+    stat_modifier_bullet_resist: f32,
+    stat_modifier_spirit_resist: f32,
+    stat_modifier_values_available: bool,
+    unknown_stat_modifier_count: i32,
 }
 
 /// One of a hero's signature abilities (constant for the match), emitted once
@@ -2729,14 +2758,6 @@ struct AbilityUpgradeEvent {
     level: i32,
 }
 
-fn stat_complete_mask(mask: boon::StatMask) -> i32 {
-    boon::StatId::ALL
-        .into_iter()
-        .enumerate()
-        .filter_map(|(bit, stat)| mask.contains(stat).then_some(1_i32 << bit))
-        .fold(0, |bits, bit| bits | bit)
-}
-
 #[derive(Default, Clone, Copy)]
 struct PlayerStats {
     net_worth: i32,
@@ -2748,18 +2769,16 @@ struct PlayerStats {
     hero_healing: i32,
     objective_damage: i32,
     health_max: i32,
-    bonus_health: f32,
-    spirit_power: f32,
-    fire_rate: f32,
-    weapon_damage: f32,
-    cooldown_reduction: f32,
-    ammo: f32,
-    bullet_resist: f32,
-    spirit_resist: f32,
-    status_resist: f32,
-    bullet_lifesteal: f32,
-    spirit_lifesteal: f32,
-    stat_complete_mask: i32,
+    stat_modifier_health: f32,
+    stat_modifier_spirit_power: f32,
+    stat_modifier_fire_rate: f32,
+    stat_modifier_weapon_damage: f32,
+    stat_modifier_cooldown_reduction: f32,
+    stat_modifier_ammo: f32,
+    stat_modifier_bullet_resist: f32,
+    stat_modifier_spirit_resist: f32,
+    stat_modifier_values_available: bool,
+    unknown_stat_modifier_count: i32,
 }
 
 fn get_i64(e: &boon::Entity, key: Option<u64>) -> i64 {
@@ -2781,6 +2800,16 @@ fn get_f32(e: &boon::Entity, key: Option<u64>) -> f32 {
             _ => None,
         })
         .unwrap_or(0.0)
+}
+
+fn current_simulation_time(ctx: &boon::Context, key: Option<u64>) -> Option<f32> {
+    let key = key?;
+    ctx.entities()
+        .iter()
+        .filter(|(_, entity)| entity.class_name.as_ref() == PAWN_CLASS)
+        .map(|(_, entity)| entity.get_f32(Some(key)))
+        .filter(|value| value.is_finite() && *value > 0.0)
+        .max_by(f32::total_cmp)
 }
 
 fn get_string(e: &boon::Entity, key: Option<u64>) -> String {
