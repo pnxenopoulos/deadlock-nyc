@@ -3,6 +3,8 @@ import { X } from "lucide-react";
 import { TEAM_COLORS, TEAM_NAMES } from "@/components/player-roster";
 import { Button } from "@/components/ui/button";
 import { useDialogEscape } from "@/lib/use-dialog-escape";
+import boonDataVersion from "@/data/boon-version.json";
+import type { CatalogInfo } from "@/wasm/catalog";
 
 export function DemoInfoDialog({
   open,
@@ -12,6 +14,7 @@ export function DemoInfoDialog({
   totalTicks,
   regulationClock,
   winner,
+  catalog,
 }: {
   open: boolean;
   onClose: () => void;
@@ -22,6 +25,7 @@ export function DemoInfoDialog({
   regulationClock: string | null;
   /** Winning team number, or null if the recording has no game-over. */
   winner: number | null;
+  catalog?: CatalogInfo;
 }) {
   useDialogEscape(open, onClose);
   if (!open) return null;
@@ -54,6 +58,10 @@ export function DemoInfoDialog({
           <Row label="Game mode">
             <span className="font-medium">{mode}</span>
           </Row>
+          <Row label="boon-data version">
+            <span className="font-medium">{catalog?.version ?? boonDataVersion.client_version}</span>
+          </Row>
+          {catalog?.demoVersion && <Row label="Demo client version"><span className="font-medium">{catalog.demoVersion}</span></Row>}
           <Row label="Total ticks">
             <span className="font-medium tabular-nums">
               {totalTicks.toLocaleString()}
@@ -76,6 +84,9 @@ export function DemoInfoDialog({
             )}
           </Row>
         </dl>
+        {catalog?.demoVersion && catalog.demoVersion !== catalog.version && (
+          <p className="mt-3 text-xs text-amber-500">No bundled catalog for this demo build. Calculated stats and pickup counts may differ.</p>
+        )}
       </div>
     </div>
   );

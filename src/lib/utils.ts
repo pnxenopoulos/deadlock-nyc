@@ -1,6 +1,9 @@
 import { clsx, type ClassValue } from "clsx";
 import { twMerge } from "tailwind-merge";
 
+// Source/Hammer coordinates are approximately inches.
+export const SOURCE_UNITS_PER_METER = 39.37007874;
+
 export function cn(...inputs: ClassValue[]) {
   return twMerge(clsx(inputs));
 }

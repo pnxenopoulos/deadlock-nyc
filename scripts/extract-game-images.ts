@@ -1,22 +1,24 @@
 // Extract only the compiled Deadlock textures referenced by the generated
 // manifests, then decompile them into panorama/images/ for build-images.ts.
 
-import { existsSync, readdirSync, readFileSync } from "node:fs";
+import { copyFileSync, existsSync, readdirSync, readFileSync } from "node:fs";
 import { availableParallelism, homedir } from "node:os";
-import { join, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { findSource2ViewerCli, source2ViewerEnv } from "./source2viewer";
+import minimapImages from "../src/data/minimap-images.json";
 
 const ROOT = resolve(import.meta.dir, "..");
+const HEROES_ONLY = process.argv.includes("--heroes-only");
+const ABILITIES_ONLY = process.argv.includes("--abilities-only");
+const MINIMAP_ONLY = process.argv.includes("--minimap-only");
 const MANIFESTS = [
   "src/data/item-icons.json",
   "src/data/hero-portraits.json",
   "src/data/ability-icons.json",
 ];
-const MINIMAP_SOURCES = [
-  "minimap/base/minimap_midtown_mid_psd_dd4bcbf9.png",
-  "minimap/base/minimap_midtown_mid_tunnels_psd.png",
-];
+const MINIMAP_SOURCES = Object.values(minimapImages).map((layer) => layer.sourceRel);
 const RANK_FILTER = "panorama/images/ranked/badges/";
+const PROPERTY_ICON_FILTER = "panorama/images/icons/properties/";
 
 function die(message: string): never {
   console.error(`ERROR: ${message}`);
@@ -53,6 +55,9 @@ function findDeadlockVpk(): string | null {
 function referencedResources(): string[] {
   const resources = new Set<string>();
   for (const manifest of MANIFESTS) {
+    if (MINIMAP_ONLY) continue;
+    if (HEROES_ONLY && manifest !== "src/data/hero-portraits.json") continue;
+    if (ABILITIES_ONLY && manifest !== "src/data/ability-icons.json") continue;
     const path = resolve(ROOT, manifest);
     if (!existsSync(path)) die(`manifest not found: ${path} (run \`bun run sync\` first)`);
     const urls = Object.values(
@@ -62,7 +67,7 @@ function referencedResources(): string[] {
       resources.add(`panorama/images/${url.replace(/^\//, "").replace(/\.webp$/, ".vtex_c")}`);
     }
   }
-  for (const source of MINIMAP_SOURCES) {
+  for (const source of HEROES_ONLY || ABILITIES_ONLY ? [] : MINIMAP_SOURCES) {
     resources.add(`panorama/images/${source.replace(/\.png$/, ".vtex_c")}`);
   }
   return [...resources].sort();
@@ -86,7 +91,48 @@ async function run(cli: string, args: string[], label: string) {
   }
 }
 
+async function refreshDefinitions(cli: string, vpk: string) {
+  // Generate mappings from the same installation as the textures instead of
+  // silently omitting new heroes/abilities when GameTracking's cache is stale.
+  const installedDirectory = resolve(ROOT, "scripts/.vdata/installed-game");
+  const definitions = [
+    ...(!ABILITIES_ONLY ? ["scripts/heroes.vdata_c"] : []),
+    ...(!HEROES_ONLY ? ["scripts/abilities.vdata_c"] : []),
+  ];
+  await run(
+    cli,
+    ["-i", vpk, "-o", installedDirectory, "-d", "-f", definitions.join(",")],
+    "Refreshing image definitions from the installed game...",
+  );
+  const cachedScripts = join(installedDirectory, "scripts");
+  if (!HEROES_ONLY) {
+    // Localization is shipped as loose files alongside the VPK.
+    for (const name of ["citadel_heroes", "citadel_gc_mod_names"]) {
+      const file = `${name}_english.txt`;
+      const source = join(dirname(vpk), "resource/localization", name, file);
+      if (!existsSync(source)) die(`English ability localization not found: ${source}`);
+      copyFileSync(source, join(cachedScripts, file));
+    }
+  }
+  const generators = [
+    ...(!ABILITIES_ONLY ? ["build-hero-portraits"] : []),
+    ...(!HEROES_ONLY ? ["build-ability-icons", "build-ability-names"] : []),
+  ];
+  for (const name of generators) {
+    const generator = Bun.spawn([process.execPath, "run", `scripts/${name}.ts`], {
+      cwd: ROOT,
+      env: { ...process.env, VDATA_DIR: cachedScripts },
+      stdout: "inherit",
+      stderr: "inherit",
+    });
+    if ((await generator.exited) !== 0) die(`${name} failed`);
+  }
+}
+
 async function main() {
+  if ([HEROES_ONLY, ABILITIES_ONLY, MINIMAP_ONLY].filter(Boolean).length > 1) {
+    die("Choose only one of --heroes-only, --abilities-only or --minimap-only");
+  }
   const cli = findSource2ViewerCli(ROOT);
   if (!cli) {
     die("Source2Viewer-CLI not found; set SOURCE2VIEWER_CLI to its executable path");
@@ -100,10 +146,12 @@ async function main() {
   const threads = Number.isInteger(requestedThreads) && requestedThreads > 0
     ? requestedThreads
     : Math.min(8, availableParallelism());
-  const resources = referencedResources();
-
   console.log(`Source 2 Viewer: ${cli}`);
   console.log(`Deadlock VPK: ${vpk}`);
+
+  if (!MINIMAP_ONLY) await refreshDefinitions(cli, vpk);
+
+  const resources = referencedResources();
   console.log(`Extracting ${resources.length} referenced textures with ${threads} threads...`);
 
   await run(
@@ -116,8 +164,13 @@ async function main() {
       "-f", resources.join(","),
       "--threads", String(threads),
     ],
-    "Decompiling referenced item, hero, ability, and minimap textures...",
+    "Decompiling referenced textures...",
   );
+
+  if (HEROES_ONLY || ABILITIES_ONLY || MINIMAP_ONLY) {
+    console.log("Done. Extracted images into panorama/images/.");
+    return;
+  }
 
   // build-images.ts decompiles rank textures on demand, so preserve these as
   // their original compiled resources instead of exporting them as PNG only.
@@ -125,6 +178,19 @@ async function main() {
     cli,
     ["-i", vpk, "-o", ROOT, "-e", "vtex_c", "-f", RANK_FILTER],
     "Extracting compiled rank badges...",
+  );
+
+  await run(
+    cli,
+    [
+      "-i", vpk,
+      "-o", ROOT,
+      "-d",
+      "-e", "vsvg_c",
+      "-f", PROPERTY_ICON_FILTER,
+      "--threads", String(threads),
+    ],
+    "Decompiling stat property icons...",
   );
 
   console.log("Done. Extracted game images into panorama/images/.");

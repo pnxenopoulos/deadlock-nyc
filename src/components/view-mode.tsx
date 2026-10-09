@@ -1,5 +1,5 @@
 import * as React from "react";
-import { Flame, Grid3x3, LineChart, Map } from "lucide-react";
+import { Flame, Grid3x3, LineChart, Map, Swords } from "lucide-react";
 
 import {
   Tooltip,
@@ -8,13 +8,14 @@ import {
 } from "@/components/ui/tooltip";
 import { cn } from "@/lib/utils";
 
-export type ViewMode = "map" | "timeline" | "matrix" | "heatmap";
+export type ViewMode = "map" | "timeline" | "matrix" | "heatmap" | "lanes";
 export type DemoMode = "Ranked" | "Standard" | "Street Brawl";
 
 // The top-level ways to look at a parsed demo.
 const VIEWS: { value: ViewMode; label: string; icon: typeof Map }[] = [
   { value: "map", label: "Map", icon: Map },
   { value: "timeline", label: "Timeline", icon: LineChart },
+  { value: "lanes", label: "Laning", icon: Swords },
   { value: "matrix", label: "Matrix", icon: Grid3x3 },
   { value: "heatmap", label: "Heatmap", icon: Flame },
 ];

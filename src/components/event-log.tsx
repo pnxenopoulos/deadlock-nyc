@@ -258,7 +258,10 @@ const NowDivider = React.forwardRef<HTMLLIElement, { label: string }>(
       <li ref={ref} className="bg-primary/5">
         <div className="flex items-center gap-2 px-2 py-1">
           <span className="h-px flex-1 bg-primary/40" />
-          <span className="flex items-center gap-1 font-mono text-[10px] font-semibold uppercase tracking-wide text-primary tabular-nums">
+          <span
+            className="flex items-center gap-1 font-mono text-[10px] font-semibold uppercase tracking-wide text-primary tabular-nums"
+            title="Regulation time (excludes match pauses)"
+          >
             <span className="size-1.5 rounded-full bg-primary" />
             now · {label}
           </span>
@@ -528,7 +531,7 @@ function ObjectiveList({
               <span className="font-medium" style={{ color }}>
                 {meta.label}
               </span>{" "}
-              <span className="text-muted-foreground">{e.action ?? meta.verb}</span>
+              <span className="text-muted-foreground">{(e.action ?? meta.verb).replaceAll("_", " ")}</span>
             </span>
             {killer ? (
               <HeroChip

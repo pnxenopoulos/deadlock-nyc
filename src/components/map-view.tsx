@@ -28,7 +28,8 @@ import {
   TooltipContent,
   TooltipTrigger,
 } from "@/components/ui/tooltip";
-import { assetUrl, cn } from "@/lib/utils";
+import { assetUrl, cn, SOURCE_UNITS_PER_METER } from "@/lib/utils";
+import minimapImages from "@/data/minimap-images.json";
 import type { FrameStore, PositionFrame } from "@/wasm/frames";
 
 export type { PlayerPosition, PositionFrame } from "@/wasm/frames";
@@ -76,6 +77,7 @@ export interface PauseInterval {
 }
 
 export interface PositionsResult {
+  permanent_buffs: import("@/wasm/pickups").PickupEvent[];
   game_mode: number;
   match_mode: number;
   frames: FrameStore;
@@ -207,6 +209,10 @@ export interface ObjectiveHealthEvent {
   id: number;
   health: number;
   max_health: number;
+  /** Patron netvar: 0 = first phase, 2 = transforming, 1 = final phase. */
+  phase?: number;
+  x?: number;
+  y?: number;
 }
 
 /** A live objective resolved at the current tick, ready to draw. */
@@ -217,6 +223,7 @@ export interface ObjectiveState {
   health: number;
   max_health: number;
   color: string;
+  phase?: number;
 }
 
 /** The Rift's live world position, reconstructed from sparse lifecycle events. */
@@ -240,6 +247,47 @@ export const OBJECTIVE_ICONS: Record<ObjectiveKind, LucideIcon> = {
   objective: Flag,
 };
 
+/** Patron's outer ring is phase one; the inner ring is phase two. A dashed
+ * inner ring is pending, not an estimate of the future phase's health. */
+export function ObjectiveNode({ objective: o }: { objective: ObjectiveState }) {
+  const patron = o.kind === "patron" && o.phase != null;
+  const major = o.kind === "patron" || o.kind === "mid_boss";
+  const radius = major ? 360 : 250;
+  const ratio = o.max_health > 0 ? Math.max(0, Math.min(1, o.health / o.max_health)) : 1;
+  const Icon = OBJECTIVE_ICONS[o.kind] ?? OBJECTIVE_ICONS.objective;
+  const iconSize = radius * (patron ? 0.9 : 1.15);
+  const final = o.phase === 1;
+  const rings = patron ? [
+    { radius, width: 80, ratio: o.phase === 0 ? ratio : 0, pending: false },
+    { radius: 240, width: 60, ratio: final ? ratio : 0, pending: !final },
+  ] : [{ radius, width: major ? 95 : 75, ratio, pending: false }];
+  const label = patron
+    ? `Patron — ${final ? "phase 2" : o.phase === 2 ? "transforming" : "phase 1"}. Outer ring: phase 1; inner ring: phase 2${final ? "" : " (pending)"}.`
+    : o.kind.replaceAll("_", " ");
+  return (
+    <g aria-label={label}>
+      <title>{label}</title>
+      <circle r={radius} fill="rgba(12,14,22,0.82)" />
+      {rings.map((ring) => {
+        const circumference = 2 * Math.PI * ring.radius;
+        return <React.Fragment key={ring.radius}>
+          <circle
+            r={ring.radius}
+            fill="none"
+            stroke={patron ? o.color : "rgba(255,255,255,0.16)"}
+            strokeOpacity={patron ? ring.pending ? 0.8 : 0.4 : 1}
+            strokeWidth={ring.width}
+            strokeDasharray={ring.pending ? "45 35" : undefined}
+            data-phase-track={patron ? ring.radius === radius ? 1 : 2 : undefined}
+          />
+          {ring.ratio > 0 && <circle r={ring.radius} fill="none" stroke={o.color} strokeWidth={ring.width} strokeDasharray={`${ring.ratio * circumference} ${circumference}`} transform="rotate(-90)" />}
+        </React.Fragment>;
+      })}
+      <Icon x={-iconSize / 2} y={-iconSize / 2} width={iconSize} height={iconSize} color="#fff" strokeWidth={2.4} />
+    </g>
+  );
+}
+
 /** Stable objective kind slugs emitted by the parser. */
 export type ObjectiveKind =
   | "guardian"
@@ -254,14 +302,19 @@ export type ObjectiveKind =
 
 export type ObjectiveAction =
   | "destroyed"
+  | "phase_one_destroyed"
   | "killed"
   | "spawns"
+  | "picked_up"
+  | "dropped"
+  | "returned"
   | "opened"
   | "captured"
   | "expired";
 
 /**
- * An objective destruction. `team` is the losing/owning team (−1/4 for the
+ * An objective transition. `team` is the losing/owning team (or the Urn carrier's
+ * team; −1/4 for the
  * neutral Mid-Boss); `x`/`y` are world-space (null only if the message ever
  * omits a position).
  */
@@ -330,7 +383,6 @@ export const WORLD_SIZE = 21504;
 // Deadlock map coordinates use Source/Hammer units (approximately one inch).
 // Keep the gameplay-facing radius in metres and convert only for map drawing.
 export const RIFT_RADIUS_METERS = 20;
-const SOURCE_UNITS_PER_METER = 39.37007874;
 const RIFT_RADIUS_WORLD_UNITS =
   RIFT_RADIUS_METERS * SOURCE_UNITS_PER_METER;
 export const RIFT_COLOR = "#22d3ee";
@@ -354,7 +406,7 @@ const CARET_HALF_W = 260;
 
 // Neutral (gold) accent for jungle camp chevrons.
 const NEUTRAL_CAMP_COLOR = "#e0b84a";
-const BREAKABLE_COLOR = "#fb923c";
+const BREAKABLE_COLOR = "#facc15";
 const SINNER_COLOR = "#facc15";
 
 // Warm muzzle-flash palette for the gunfire overlay — deliberately off the team
@@ -364,7 +416,7 @@ const MUZZLE_CORE = "#fff4d0";
 // Shots-per-frame (≈0.125s window) that saturates the pulse intensity.
 const MUZZLE_FULL_SHOTS = 3;
 
-// Cyan accent for the urn (Idol), shared with the objectives feed.
+// Cyan accent for the urn, shared with the objectives feed.
 export const URN_COLOR = "#22d3ee";
 
 // Lane trooper dot radius (world units) — small; counter-scaled to stay ~4px.
@@ -434,22 +486,13 @@ const LAYER_TOGGLES: {
     key: "urn",
     label: "Urn",
     Icon: Amphora,
-    desc: "The urn's (Idol's) live location",
+    desc: "The urn's live location",
   },
 ];
 
-export type MapLayer = "surface" | "tunnels";
+export type MapLayer = keyof typeof minimapImages;
 
-export const LAYERS: Record<MapLayer, { label: string; src: string }> = {
-  surface: {
-    label: "Surface",
-    src: "/minimap/minimap_midtown_mid_psd_dd4bcbf9.webp",
-  },
-  tunnels: {
-    label: "Tunnels",
-    src: "/minimap/minimap_midtown_mid_tunnels_psd.webp",
-  },
-};
+export const LAYERS = minimapImages;
 
 function prettifyBreakable(name: string): string {
   if (!name || name === "BREAKABLE_NOT_FOUND") return "Breakable prop";
@@ -851,47 +894,13 @@ export function MapView({
               if (layer === "tunnels" && o.kind !== "mid_boss") return null;
               const ocx = o.x - WORLD_MIN;
               const ocy = WORLD_SIZE - (o.y - WORLD_MIN);
-              const major = o.kind === "patron" || o.kind === "mid_boss";
-              const R = major ? 360 : 250; // node radius in world units
-              const ringW = major ? 95 : 75;
-              const ratio =
-                o.max_health > 0
-                  ? Math.max(0, Math.min(1, o.health / o.max_health))
-                  : 1;
-              const circ = 2 * Math.PI * R;
-              const Icon = OBJECTIVE_ICONS[o.kind] ?? OBJECTIVE_ICONS.objective;
-              const iconSize = R * 1.15;
               const nodeScale = 1 / zoom;
               return (
                 <g
                   key={`obj-state-${i}`}
                   transform={`translate(${ocx} ${ocy}) scale(${nodeScale})`}
                 >
-                  <circle r={R} fill="rgba(12,14,22,0.82)" />
-                  <circle
-                    r={R}
-                    fill="none"
-                    stroke="rgba(255,255,255,0.16)"
-                    strokeWidth={ringW}
-                  />
-                  {ratio > 0 && (
-                    <circle
-                      r={R}
-                      fill="none"
-                      stroke={o.color}
-                      strokeWidth={ringW}
-                      strokeDasharray={`${ratio * circ} ${circ}`}
-                      transform="rotate(-90)"
-                    />
-                  )}
-                  <Icon
-                    x={-iconSize / 2}
-                    y={-iconSize / 2}
-                    width={iconSize}
-                    height={iconSize}
-                    color="#fff"
-                    strokeWidth={2.4}
-                  />
+                  <ObjectiveNode objective={o} />
                 </g>
               );
             })}
@@ -1097,7 +1106,7 @@ export function MapView({
                 </g>
               );
             })}
-            {/* Live urn (Idol): a cyan badge wherever the urn entity currently
+            {/* Live urn: a cyan badge wherever the urn entity currently
                 is (on the ground or mid auto-return). Flat [x0,y0,x1,y1,…];
                 usually one, briefly two during a handoff. Rendered last so it
                 sits on top of everything, including a co-located hero. */}
@@ -1180,6 +1189,13 @@ export function MapView({
             );
           })}
         </div>
+
+        {layer === "surface" && layers.objectives && objectiveStates?.some((o) => o.kind === "patron" && o.phase != null) && (
+          <div className="pointer-events-none absolute bottom-2 left-2 rounded border border-border bg-background/85 px-2 py-1 text-[10px] text-muted-foreground backdrop-blur">
+            Patron rings: outer = phase 1 · inner = phase 2<br />
+            Dashed = pending
+          </div>
+        )}
 
         {/* Zoom controls (scroll-to-zoom still works too). */}
         <div className="absolute top-2 right-2 flex flex-col gap-1">

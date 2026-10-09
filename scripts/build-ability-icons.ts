@@ -11,8 +11,8 @@
 // same entry name the message's ability_name carries (citadel_ability_*,
 // ability_*), so the feed can look up an icon directly.
 //
-// Input:  $VDATA_DIR/abilities.vdata  (default scripts/.vdata; falls back to the
-//         repo-root copy).
+// Input:  $VDATA_DIR/abilities.vdata, cached installed-game definitions, or
+//         scripts/.vdata (falling back to the repo-root copy).
 // Output: src/data/ability-icons.json
 //
 // Run via the sync script, or standalone: `bun run ability-icons`
@@ -23,9 +23,12 @@ import { resolve } from "node:path";
 import { topLevelEntries, field, imageUrlFromPanorama } from "./lib/kv3";
 
 const ROOT = resolve(import.meta.dir, "..");
+const installedDirectory = resolve(ROOT, "scripts/.vdata/installed-game/scripts");
 const VDATA_DIR = process.env.VDATA_DIR
   ? resolve(process.env.VDATA_DIR)
-  : resolve(ROOT, "scripts/.vdata");
+  : existsSync(resolve(installedDirectory, "abilities.vdata"))
+    ? installedDirectory
+    : resolve(ROOT, "scripts/.vdata");
 const OUTPUT = resolve(ROOT, "src/data/ability-icons.json");
 
 const synced = resolve(VDATA_DIR, "abilities.vdata");

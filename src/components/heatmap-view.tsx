@@ -9,9 +9,9 @@ import {
   type AbilityEvent,
   type KillEvent,
   type MapLayer,
-  type ModifierSpan,
   type ObjectiveEvent,
   type ObjectiveInfo,
+  type PauseInterval,
   type PositionFrame,
 } from "@/components/map-view";
 import {
@@ -28,7 +28,9 @@ import {
   TooltipTrigger,
 } from "@/components/ui/tooltip";
 import { assetUrl, cn } from "@/lib/utils";
+import { OutnumberedCombat, OUTNUMBERED_RADIUS_METERS } from "@/lib/outnumbered-combat";
 import type { FrameStore } from "@/wasm/frames";
+import type { StatusStore } from "@/wasm/statuses";
 
 const TICKS_PER_SECOND = 64;
 // Bins per axis for the density grid (over the 21504² world square).
@@ -134,6 +136,7 @@ function binCells(points: { x: number; y: number }[]): Cell[] {
 }
 
 const pctDelta = (n: number) => `${Math.round(n)}%`;
+const seconds = (n: number) => `${n.toFixed(1)}s`;
 const avgOf = (xs: number[]) =>
   xs.length ? xs.reduce((a, b) => a + b, 0) / xs.length : null;
 
@@ -198,7 +201,8 @@ export function HeatmapView({
   frames,
   objectives,
   objectiveEvents,
-  modifierSpans,
+  statuses,
+  pauseIntervals,
 }: {
   players: PlayerInfo[];
   killEvents: KillEvent[];
@@ -206,7 +210,8 @@ export function HeatmapView({
   frames: FrameStore;
   objectives: ObjectiveInfo[];
   objectiveEvents: ObjectiveEvent[];
-  modifierSpans: ModifierSpan[];
+  statuses: StatusStore;
+  pauseIntervals: PauseInterval[];
 }) {
   const [selected, setSelected] = React.useState<Set<number>>(
     () => new Set(players[0] ? [players[0].hero_id] : []),
@@ -534,27 +539,18 @@ export function HeatmapView({
     return out;
   }, [patrons, frames, players, range]);
 
-  // Time in combat per hero: share of the window flagged in-combat (the
-  // `modifier_combat_status` span). Null when the window is empty.
-  const combatByHero = React.useMemo(() => {
-    const [lo, hi] = range;
-    const windowTicks = hi - lo;
-    const m = new Map<number, number | null>();
-    for (const { hero_id: id } of players) {
-      if (windowTicks <= 0) {
-        m.set(id, null);
-        continue;
-      }
-      let inCombat = 0;
-      for (const s of modifierSpans) {
-        if (s.hero_id !== id || !s.modifier_name.includes("combat_status")) continue;
-        const ov = Math.min(hi, s.end_tick ?? maxTick) - Math.max(lo, s.start_tick);
-        if (ov > 0) inCombat += ov;
-      }
-      m.set(id, (Math.min(windowTicks, inCombat) / windowTicks) * 100);
-    }
-    return m;
-  }, [modifierSpans, players, range, maxTick]);
+  const combatByHero = React.useMemo(() => new Map(players.map((player) => [
+    player.hero_id,
+    statuses.percentageInWindow(player.steam_id, "IN_COMBAT", range[0], range[1]),
+  ])), [statuses, players, range]);
+
+  const outnumbered = React.useMemo(() => new OutnumberedCombat(
+    frames, players, statuses, pauseIntervals,
+  ), [frames, players, statuses, pauseIntervals]);
+  const outnumberedByHero = React.useMemo(() => new Map(players.map((player) => [
+    player.hero_id,
+    outnumbered.secondsInWindow(player.hero_id, range[0], range[1]),
+  ])), [outnumbered, players, range]);
 
   // Vertical event bars for the timeline brush: kills (victim-team colored) and
   // objective falls (gold).
@@ -644,6 +640,7 @@ export function HeatmapView({
                 p,
                 hs: heroStats.get(p.hero_id),
                 cb: combatByHero.get(p.hero_id) ?? null,
+                outn: outnumberedByHero.get(p.hero_id) ?? null,
               }));
               // Reference = the whole team's average for this window, so the
               // per-hero deltas are meaningful even with a single hero selected.
@@ -663,6 +660,8 @@ export function HeatmapView({
                 enemy: avgOf(halves.map((h) => h.enemy)),
                 ptrn: avgOf(halves.map((h) => h.avgDistPct)),
                 cbt: avgOf(combats),
+                outn: avgOf(teamAll.map((q) => outnumberedByHero.get(q.hero_id) ?? null)
+                  .filter((v): v is number => v != null)),
                 dist: avgOf(teamAll.map((q) => heroStats.get(q.hero_id)?.distance ?? 0)),
               };
               return (
@@ -674,30 +673,31 @@ export function HeatmapView({
                     />
                     {TEAM_NAMES[team]}
                   </div>
-                  <div className="overflow-hidden rounded-md border border-border bg-card">
+                  <div className="overflow-x-auto rounded-md border border-border bg-card">
                     <table className="w-full text-[11px] tabular-nums">
                       <thead className="bg-muted text-[10px] text-muted-foreground">
                         <tr>
-                          <th className="px-1.5 py-1 text-left font-medium">Hero</th>
+                          <th className="px-1.5 py-1 text-left font-medium">HERO</th>
                           {[
-                            { k: "half", label: "Half split", title: "Half split — own / mid / enemy half" },
-                            { k: "ptrn", label: "Ptrn", title: "Avg distance to your Patron (% of map)" },
-                            { k: "cbt", label: "Cbt", title: "Time in combat (% of window)" },
-                            { k: "dist", label: "Dist", title: "Distance covered (world units)" },
+                            { k: "half", label: "HALF SPLIT", title: "Half split — own / mid / enemy half" },
+                            { k: "ptrn", label: "PTRN", title: "Avg distance to your Patron (% of map)" },
+                            { k: "cbt", label: "CBT", title: "Time with In combat status (% of window)" },
+                            { k: "outn", label: "OUTN", title: `Seconds alive with In combat status when living enemies outnumber your side within ${OUTNUMBERED_RADIUS_METERS} m (3D distance, includes you). Pauses excluded; proximity is not line of sight. Team row shows the average.` },
+                            { k: "dist", label: "DIST", title: "Distance covered (world units)" },
                           ].map((c) => (
                             <th key={c.k} className="px-1.5 py-1 text-right font-medium">
                               <Tooltip>
                                 <TooltipTrigger asChild>
                                   <span className="cursor-default">{c.label}</span>
                                 </TooltipTrigger>
-                                <TooltipContent>{c.title}</TooltipContent>
+                                <TooltipContent className="max-w-72">{c.title}</TooltipContent>
                               </Tooltip>
                             </th>
                           ))}
                         </tr>
                       </thead>
                       <tbody>
-                        {rows.map(({ p, hs, cb }) => {
+                        {rows.map(({ p, hs, cb, outn }) => {
                           const portrait = heroPortraitUrl(p.hero_id);
                           return (
                             <tr key={p.hero_id} className="border-t border-border">
@@ -767,6 +767,13 @@ export function HeatmapView({
                                 fmt={pctDelta}
                               />
                               <StatCell
+                                display={outn == null ? "—" : seconds(outn)}
+                                value={outn}
+                                avg={avg.outn}
+                                label="Time in outnumbered combat"
+                                fmt={seconds}
+                              />
+                              <StatCell
                                 display={compactNumber(Math.round(hs?.distance ?? 0))}
                                 value={hs?.distance ?? null}
                                 avg={avg.dist}
@@ -780,7 +787,7 @@ export function HeatmapView({
                       <tfoot>
                           <tr className="border-t border-border bg-muted/40 font-medium">
                             <td className="px-1.5 py-1 text-left text-[10px] uppercase tracking-wide text-muted-foreground">
-                              Team
+                              TEAM
                             </td>
                             <td className="px-1.5 py-1">
                               {avg.own != null ? (
@@ -798,6 +805,9 @@ export function HeatmapView({
                             </td>
                             <td className="px-1.5 py-1 text-right">
                               {avg.cbt != null ? `${Math.round(avg.cbt)}%` : "—"}
+                            </td>
+                            <td className="px-1.5 py-1 text-right">
+                              {avg.outn != null ? seconds(avg.outn) : "—"}
                             </td>
                             <td className="px-1.5 py-1 text-right">
                               {avg.dist != null ? compactNumber(Math.round(avg.dist)) : "—"}

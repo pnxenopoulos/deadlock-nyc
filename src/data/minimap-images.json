@@ -1,0 +1,12 @@
+{
+  "surface": {
+    "label": "Surface",
+    "src": "/minimap/minimap_midtown_mid_psd.webp",
+    "sourceRel": "minimap/base/minimap_midtown_mid_psd.png"
+  },
+  "tunnels": {
+    "label": "Tunnels",
+    "src": "/minimap/minimap_midtown_mid_tunnels_psd.webp",
+    "sourceRel": "minimap/base/minimap_midtown_mid_tunnels_psd.png"
+  }
+}

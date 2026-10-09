@@ -13,6 +13,9 @@ import { DemoInfoDialog } from "@/components/demo-info-dialog";
 import { EventLog } from "@/components/event-log";
 import { HeatmapView } from "@/components/heatmap-view";
 import { TimelineView } from "@/components/timeline-view";
+import { LaneView } from "@/components/lane-view";
+import { PickupStore } from "@/wasm/pickups";
+import type { CatalogInfo } from "@/wasm/catalog";
 import { MatrixView } from "@/components/matrix-view";
 import {
   MapView,
@@ -67,8 +70,16 @@ import {
   TooltipTrigger,
 } from "@/components/ui/tooltip";
 import { cn } from "@/lib/utils";
-import { parseDemo, type MatchSummary } from "@/wasm/boon";
+import { regulationTicksAt } from "@/lib/replay-clock";
+import { objectivesAt } from "@/lib/objectives";
+import { disposeDemo, parseDemoFile, type MatchSummary } from "@/wasm/boon";
+import type { StatusStore } from "@/wasm/statuses";
 import type { FrameStore } from "@/wasm/frames";
+import {
+  disposePlayerDetails,
+  queryPlayerDetails,
+  type PlayerDetails,
+} from "@/wasm/player-details";
 import {
   ViewPlaceholder,
   useViewMode,
@@ -98,10 +109,11 @@ type State =
   | {
       kind: "parsing";
       name: string;
-      progress?: { tick: number; total: number };
+      progress?: { tick: number; total: number; phase?: string };
     }
   | {
       kind: "done";
+      file: File;
       name: string;
       header: unknown;
       mode: DemoMode;
@@ -127,6 +139,9 @@ type State =
       players: PlayerInfo[];
       winner: number | null;
       summary: MatchSummary;
+      statuses: StatusStore;
+      permanentBuffs: PickupStore;
+      catalog: CatalogInfo;
     }
   | { kind: "error"; message: string };
 
@@ -134,6 +149,7 @@ export function UploadZone() {
   const [state, setState] = React.useState<State>({ kind: "idle" });
   const { setDemoLoaded, setDemoMode } = useViewMode();
   const loadedMode = state.kind === "done" ? state.mode : null;
+  React.useEffect(() => () => { disposePlayerDetails(); disposeDemo(); }, []);
 
   // The header's view switcher and mode badge only appear after parsing.
   React.useEffect(() => {
@@ -142,18 +158,19 @@ export function UploadZone() {
   }, [state.kind, loadedMode, setDemoLoaded, setDemoMode]);
 
   async function handleFile(file: File) {
+    disposePlayerDetails();
     setState({ kind: "parsing", name: file.name });
     try {
-      const bytes = new Uint8Array(await file.arrayBuffer());
-      const parsed = await parseDemo(bytes, SAMPLE_EVERY_TICKS, (tick, total) => {
+      const parsed = await parseDemoFile(file, SAMPLE_EVERY_TICKS, (tick, total, phase) => {
         setState((s) =>
           s.kind === "parsing"
-            ? { kind: "parsing", name: s.name, progress: { tick, total } }
+            ? { kind: "parsing", name: s.name, progress: { tick, total, phase } }
             : s,
         );
       });
       setState({
         kind: "done",
+        file,
         name: file.name,
         header: parsed.header,
         mode: demoModeLabel(
@@ -182,6 +199,9 @@ export function UploadZone() {
         players: parsed.players,
         winner: parsed.winner,
         summary: parsed.summary,
+        statuses: parsed.statuses,
+        permanentBuffs: new PickupStore(parsed.positions.permanent_buffs),
+        catalog: parsed.catalog,
       });
     } catch (err) {
       setState({
@@ -194,6 +214,7 @@ export function UploadZone() {
   if (state.kind === "done") {
     return (
       <DemoView
+        file={state.file}
         name={state.name}
         mode={state.mode}
         frames={state.frames}
@@ -218,6 +239,9 @@ export function UploadZone() {
         players={state.players}
         winner={state.winner}
         summary={state.summary}
+        statuses={state.statuses}
+        permanentBuffs={state.permanentBuffs}
+        catalog={state.catalog}
       />
     );
   }
@@ -237,7 +261,7 @@ function IdleView({
   const parsing = state.kind === "parsing";
   const prog = state.kind === "parsing" ? state.progress : undefined;
   const pct =
-    prog && prog.total > 0
+    prog && !prog.phase && prog.total > 0
       ? Math.min(100, (prog.tick / prog.total) * 100)
       : null;
 
@@ -292,7 +316,7 @@ function IdleView({
           <div className="w-full max-w-sm text-center">
             <p className="text-base font-medium">
               {parsing
-                ? `Parsing ${state.name}…`
+                ? `${prog?.phase ?? `Parsing ${state.name}`}…`
                 : "Drop a .dem file or click to select"}
             </p>
             {parsing ? (
@@ -309,7 +333,7 @@ function IdleView({
                   />
                 </div>
                 <p className="mt-2 font-mono text-xs tabular-nums text-muted-foreground">
-                  {prog
+                  {prog?.phase ? "preparing replay…" : prog
                     ? `tick ${prog.tick.toLocaleString()}` +
                       (prog.total > 0
                         ? ` / ${prog.total.toLocaleString()}`
@@ -373,6 +397,7 @@ function formatClock(totalSeconds: number): string {
 }
 
 function DemoView({
+  file,
   name,
   mode,
   frames,
@@ -397,7 +422,11 @@ function DemoView({
   players,
   winner,
   summary,
+  statuses,
+  permanentBuffs,
+  catalog,
 }: {
+  file: File;
   name: string;
   mode: DemoMode;
   frames: FrameStore;
@@ -422,6 +451,9 @@ function DemoView({
   players: PlayerInfo[];
   winner: number | null;
   summary: MatchSummary;
+  statuses: StatusStore;
+  permanentBuffs: PickupStore;
+  catalog: CatalogInfo;
 }) {
   const [index, setIndex] = React.useState(0);
   const [playing, setPlaying] = React.useState(false);
@@ -445,6 +477,58 @@ function DemoView({
     selectedHeroId != null
       ? players.find((p) => p.hero_id === selectedHeroId)
       : undefined;
+
+  const [playerDetails, setPlayerDetails] = React.useState<{
+    loading: boolean;
+    value?: PlayerDetails;
+    error?: string;
+    steamId?: string;
+  } | null>(null);
+
+  const latestDetailTick = React.useRef(frame?.tick ?? 0);
+  latestDetailTick.current = frame?.tick ?? 0;
+  const detailTick = playing ? undefined : frame?.tick;
+
+  React.useEffect(() => {
+    if (!selectedPlayer?.steam_id || (!playing && detailTick == null)) {
+      setPlayerDetails(null);
+      return;
+    }
+    const steamId = selectedPlayer.steam_id;
+    const controller = new AbortController();
+    let timeout: number;
+    const query = () => {
+      const tick = playing ? latestDetailTick.current : detailTick!;
+      setPlayerDetails((previous) => ({
+        ...(playing && previous?.steamId === steamId ? previous : {}),
+        loading: true, steamId,
+      }));
+      void queryPlayerDetails(file, tick, steamId, controller.signal)
+        .then((value) => {
+          if (!controller.signal.aborted) setPlayerDetails({ loading: false, value, steamId });
+        })
+        .catch((error) => {
+          if (controller.signal.aborted) return;
+          setPlayerDetails({
+            loading: false,
+            error: error instanceof Error ? error.message : String(error),
+            steamId,
+          });
+        }).finally(() => {
+          // Sample the latest playback tick only after the previous query
+          // finishes. Slow queries must not starve or build a worker backlog.
+          if (playing && !controller.signal.aborted) timeout = window.setTimeout(query, 250);
+        });
+    };
+    timeout = window.setTimeout(query, 75);
+    return () => {
+      controller.abort();
+      window.clearTimeout(timeout);
+    };
+  }, [file, detailTick, playing, selectedPlayer?.steam_id]);
+
+  React.useEffect(() => () => disposePlayerDetails(), [file]);
+  const selectedDetails = playerDetails?.steamId === selectedPlayer?.steam_id ? playerDetails : null;
 
   const statsByHero = React.useMemo(() => {
     const m = new Map<number, PlayerPosition>();
@@ -592,7 +676,6 @@ function DemoView({
         spd: aliveSec > 0 ? distance / aliveSec : 0,
         depth: aliveT > 0 ? (depthT / aliveT) * 100 : 0,
         dmgShare: live && tdmg > 0 ? (live.hero_damage / tdmg) * 100 : 0,
-        objpm: live && regMinutes > 0 ? live.objective_damage / regMinutes : 0,
       });
     }
     return m;
@@ -779,6 +862,10 @@ function DemoView({
   const lastTick = frames.tickAt(frames.length - 1) ?? 0;
   const totalTicks = Math.max(0, lastTick - firstTick);
   const currentTick = frame ? frame.tick - firstTick : 0;
+  const formatRegulationTick = React.useCallback(
+    (tick: number) => formatClock(regulationTicksAt(frames, tick, pauseIntervals) / TICKS_PER_SECOND),
+    [frames, pauseIntervals],
+  );
   const regulationClock =
     regulationTicks != null
       ? formatClock(regulationTicks / TICKS_PER_SECOND)
@@ -813,8 +900,8 @@ function DemoView({
       if (e.tick > tick) break; // events are tick-ordered
       if (tick - e.tick > OBJECTIVE_MARKER_TICKS) continue;
       if (e.x == null || e.y == null) continue;
-      // The urn and Rift have live markers, so skip their transient diamonds.
-      if (e.kind === "urn" || e.kind === "rift") continue;
+      // These remain live; a destruction diamond would cover their markers.
+      if (e.kind === "urn" || e.kind === "rift" || e.action === "phase_one_destroyed") continue;
       out.push({
         x: e.x,
         y: e.y,
@@ -829,26 +916,9 @@ function DemoView({
   // spawn and death, with health replayed from the sparse samples (≤ tick).
   const objectiveStates: ObjectiveState[] = React.useMemo(() => {
     const tick = frame?.tick ?? 0;
-    const hpById = new Map<number, { health: number; max: number }>();
-    for (const e of objectiveHealth) {
-      if (e.tick > tick) break; // tick-ordered
-      hpById.set(e.id, { health: e.health, max: e.max_health });
-    }
-    const out: ObjectiveState[] = [];
-    for (const o of objectives) {
-      if (tick < o.spawn_tick) continue;
-      if (o.death_tick != null && tick >= o.death_tick) continue;
-      const hp = hpById.get(o.id);
-      out.push({
-        kind: o.kind,
-        x: o.x,
-        y: o.y,
-        health: hp?.health ?? o.max_health,
-        max_health: hp?.max ?? o.max_health,
-        color: TEAM_COLORS[o.team] ?? NEUTRAL_OBJECTIVE_COLOR,
-      });
-    }
-    return out;
+    return objectivesAt(objectives, objectiveHealth, tick).map((o) => ({
+      ...o, color: TEAM_COLORS[o.team] ?? NEUTRAL_OBJECTIVE_COLOR,
+    }));
   }, [objectives, objectiveHealth, frame]);
 
   // The Rift is not a networked objective entity, so reconstruct its live
@@ -1077,10 +1147,18 @@ function DemoView({
             abilityLevels={abilityLevelsByHero.get(selectedPlayer.hero_id)}
             abilityCooldowns={abilityCooldownsByHero.get(selectedPlayer.hero_id)}
             modifiers={activeModifiers}
+            status={statuses.at(selectedPlayer.steam_id, frame?.tick ?? 0)}
+            permanentBuffs={permanentBuffs.at(selectedPlayer.steam_id, frame?.tick ?? 0)}
+            catalog={catalog}
+            details={selectedDetails?.value}
+            detailsLoading={selectedDetails?.loading ?? false}
+            detailsError={selectedDetails?.error}
             players={players}
             tick={frame?.tick ?? 0}
             regTick={frame?.reg_ticks ?? 0}
-            onBack={() => setSelectedHeroId(null)}
+            onBack={() => {
+              setSelectedHeroId(null);
+            }}
           />
         ) : (
           <div className="flex min-h-0 min-w-[20rem] flex-1 flex-col gap-2">
@@ -1138,12 +1216,15 @@ function DemoView({
             frames={frames}
             objectives={objectives}
             objectiveEvents={objectiveEvents}
-            modifierSpans={modifierSpans}
+            statuses={statuses}
+            pauseIntervals={pauseIntervals}
           />
         ) : view === "timeline" ? (
           <TimelineView players={players} summary={summary} />
         ) : view === "matrix" ? (
           <MatrixView players={players} summary={summary} />
+        ) : view === "lanes" ? (
+          <LaneView players={players} summary={summary} />
         ) : view !== "map" ? (
           <ViewPlaceholder view={view} />
         ) : (
@@ -1188,8 +1269,11 @@ function DemoView({
                 )}{" "}
                 / <span className="tabular-nums">{totalTicks.toLocaleString()}</span>
                 {" · "}
-                <span className="tabular-nums">
-                  {formatClock((frame?.reg_ticks ?? 0) / TICKS_PER_SECOND)}
+                <span
+                  className="tabular-nums"
+                  title={`Regulation time excludes pauses. Replay time: ${formatClock(currentTick / TICKS_PER_SECOND)} (includes pauses).`}
+                >
+                  {formatRegulationTick(frame?.tick ?? firstTick)}
                 </span>{" "}
                 regulation
               </>
@@ -1213,9 +1297,7 @@ function DemoView({
           chatEvents={chatEvents}
           players={players}
           currentTick={frame?.tick ?? 0}
-          formatTick={(tick) =>
-            formatClock((tick - firstTick) / TICKS_PER_SECOND)
-          }
+          formatTick={formatRegulationTick}
           onSeek={seekToTick}
           onSelectPlayer={(heroId, tick) => {
             seekToTick(tick);
@@ -1315,6 +1397,7 @@ function DemoView({
       )}
 
       <DemoInfoDialog
+        catalog={catalog}
         open={infoOpen}
         onClose={() => setInfoOpen(false)}
         name={name}

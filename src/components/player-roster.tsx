@@ -40,6 +40,8 @@ function ApIcon({ className }: { className?: string }) {
 
 export interface PlayerInfo {
   name: string;
+  /** Decimal text so the 64-bit Steam ID is never rounded by JavaScript. */
+  steam_id: string;
   hero_id: number;
   hero_name: string;
   team: number;
@@ -66,9 +68,9 @@ export const TEAM_LOGOS: Record<number, string> = {
   3: "/teams/starburst_team1.svg", // Archmother
 };
 
-// hero_id -> small-portrait URL, generated from heroes.vdata by
-// scripts/build-hero-portraits.ts (run via `bun run sync`). Regenerate after a
-// game update rather than editing by hand.
+// hero_id -> portrait URL, generated from heroes.vdata. The image extraction
+// step refreshes these from the installed game, including vertical portraits
+// for heroes without small icons.
 const HERO_PORTRAITS = heroPortraits as Record<string, string>;
 
 export function heroPortraitUrl(heroId: number): string | null {
@@ -95,7 +97,6 @@ export function compactNumber(n: number): string {
 //  • spd      — average speed: distance ÷ time alive (world units/sec).
 //  • depth    — map forwardness: avg position from own (0%) to enemy (100%) base.
 //  • dmgShare — share of the team's hero damage at this tick.
-//  • objpm    — objective damage per elapsed regulation minute.
 export interface DerivedStats {
   uptime: number; // 0..100 (%)
   distance: number; // world (Hammer) units
@@ -107,7 +108,6 @@ export interface DerivedStats {
   spd: number; // world units / second (while alive)
   depth: number; // 0..100 (%) own base → enemy base
   dmgShare: number; // 0..100 (%) share of team hero damage
-  objpm: number; // objective damage / regulation minute
 }
 
 // A roster row's full data: the live per-tick stats plus the derived ones.
@@ -118,7 +118,7 @@ export interface RosterRow {
 
 // Per-player stat columns for the roster table. Columns are grouped into four
 // sets chosen by the Stats toggle (applied to both teams at once):
-//  • Basic    — combat & economy (KDA, souls, damage, healing).
+//  • Basic    — combat & economy (KDA, souls, damage).
 //  • Advanced — kill participation, uptime, damage rates & shares.
 //  • Econ     — net worth, souls/min, soul share, damage per net worth.
 //  • Move     — distance, speed, time in enemy half, map depth.
@@ -132,11 +132,15 @@ type StatColumn = {
 };
 
 const roundPct = (v: number) => `${Math.round(v)}%`;
+const damagePerWorth = new Intl.NumberFormat(undefined, {
+  minimumSignificantDigits: 2,
+  maximumSignificantDigits: 2,
+});
 
 export type StatGroup = "basic" | "advanced" | "econ" | "position";
 
-// Total columns per group — matches Basic, the widest set.
-const GROUP_WIDTH = 6;
+// Total columns per group — matches Basic and Advanced, the widest sets.
+const GROUP_WIDTH = 5;
 
 const K_COLUMN: StatColumn = {
   key: "k",
@@ -167,12 +171,6 @@ const DMG_COLUMN: StatColumn = {
   label: "DMG",
   title: "Hero damage",
   render: ({ live }) => compactNumber(live?.hero_damage ?? 0),
-};
-const HEAL_COLUMN: StatColumn = {
-  key: "heal",
-  label: "HEAL",
-  title: "Hero healing",
-  render: ({ live }) => compactNumber(live?.hero_healing ?? 0),
 };
 const UPT_COLUMN: StatColumn = {
   key: "upt",
@@ -233,13 +231,6 @@ const DMG_PER_DEATH_COLUMN: StatColumn = {
       Math.round((live?.hero_damage ?? 0) / Math.max(1, live?.deaths ?? 0)),
     ),
 };
-const OBJ_PM_COLUMN: StatColumn = {
-  key: "objpm",
-  label: "OBJ/m",
-  title:
-    "Objective damage per minute — objective damage ÷ elapsed regulation minutes",
-  render: ({ derived }) => compactNumber(Math.round(derived?.objpm ?? 0)),
-};
 const SPM_COLUMN: StatColumn = {
   key: "spm",
   label: "SPM",
@@ -262,7 +253,7 @@ const DMG_PER_NW_COLUMN: StatColumn = {
     const nw = live?.net_worth ?? 0;
     if (nw <= 0) return "—";
     const dmg = (live?.hero_damage ?? 0) + (live?.objective_damage ?? 0);
-    return (dmg / nw).toFixed(1);
+    return damagePerWorth.format(dmg / nw);
   },
 };
 
@@ -279,21 +270,19 @@ function pad(columns: StatColumn[]): StatColumn[] {
 }
 
 const STAT_GROUPS: Record<StatGroup, StatColumn[]> = {
-  basic: [
+  basic: pad([
     K_COLUMN,
     D_COLUMN,
     A_COLUMN,
     SOUL_COLUMN,
     DMG_COLUMN,
-    HEAL_COLUMN,
-  ],
+  ]),
   advanced: pad([
     KP_COLUMN,
     UPT_COLUMN,
     DPM_COLUMN,
     DMG_SHARE_COLUMN,
     DMG_PER_DEATH_COLUMN,
-    OBJ_PM_COLUMN,
   ]),
   econ: pad([SOUL_COLUMN, SPM_COLUMN, SPCT_COLUMN, DMG_PER_NW_COLUMN]),
   position: pad([DIST_COLUMN, SPD_COLUMN, TEH_COLUMN, DEPTH_COLUMN]),

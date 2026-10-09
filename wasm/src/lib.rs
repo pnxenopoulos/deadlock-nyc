@@ -1,8 +1,13 @@
 use std::collections::{HashMap, HashSet};
 
 use boon::Serializer;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use wasm_bindgen::prelude::*;
+
+mod barriers;
+mod pickups;
+mod statuses;
+mod summary;
 
 #[wasm_bindgen(start)]
 pub fn init() {
@@ -12,13 +17,16 @@ pub fn init() {
 #[wasm_bindgen]
 pub struct DemoParser {
     inner: boon::Parser,
+    stat_catalog: Option<boon::hero_stats::StatCatalog>,
+    state_catalog: Option<boon::player_states::StateCatalog>,
+    stat_replay: Option<boon::hero_stats::StatReplay>,
+    pickup_catalog: Option<pickups::Catalog>,
 }
 
 const PAWN_CLASS: &str = "CCitadelPlayerPawn";
 const CONTROLLER_CLASS: &str = "CCitadelPlayerController";
 const GAMERULES_CLASS: &str = "CCitadelGameRulesProxy";
-const BARRIER_TRACKER_MODIFIER_ID: u32 = 4_267_845_006;
-const RESTAMP_MIN_REAPPLY_HEROES: usize = 6;
+const HIDDEN_MODIFIER_IDS: &[u32] = &[barriers::TRACKER_ID];
 const BREAKABLE_CLASS: &str = "CCitadel_BreakableProp";
 const SINNER_CLASSES: &[&str] = &[
     "CNPC_Neutral_SinnersSacrifice",
@@ -36,12 +44,29 @@ const OBJ_CLASSES: &[&str] = &[
     "CNPC_Boss_Tier2",               // Walker (tier 2)
     "CNPC_BarrackBoss",              // Base Guardian
     "CCitadel_Destroyable_Building", // Shrine
-    "CNPC_Boss_Tier3",               // Patron (final)
+    "CNPC_Boss_Tier3",               // Patron (both phases)
     "CNPC_MidBoss",                  // Mid-Boss (neutral)
 ];
 
 /// Lane creeps (the marching troopers), plotted live on the minimap.
 const TROOPER_CLASS: &str = "CNPC_Trooper";
+
+/// Whether an NPC has usable live state at this tick.
+///
+/// pbdems2 retains entities after they leave the PVS and marks them inactive so
+/// they can reactivate later. Their last fields remain readable, so lifestate
+/// alone is not enough to decide whether they should be plotted.
+fn is_live_npc(
+    entity: &boon::Entity,
+    class_name: &str,
+    life_key: Option<u64>,
+    max_health_key: Option<u64>,
+) -> bool {
+    entity.active
+        && entity.class_name.as_ref() == class_name
+        && entity.get_i64(life_key) == 0
+        && entity.get_i64(max_health_key) > 0
+}
 
 /// Pack one alive trooper into an i32 so frames hold a flat number array rather
 /// than ~30 objects each (there are ~18k frames). Layout: bits 11–20 = qx,
@@ -64,14 +89,14 @@ const NEUTRAL_CLASS: &str = "CNPC_TrooperNeutral";
 /// mid-lane sides), so a newly-seen index = an "urn spawns" objective event.
 const IDOL_CLASS: &str = "CCitadelItemPickupIdol";
 
-/// While the Urn is carried, its world entity despawns (it's held abstractly on
-/// the player). The picker is the hero standing on the urn the instant it
-/// vanishes, so a despawn within this radius of a living pawn = a pickup, and we
-/// then plot the urn on that carrier until the entity reappears (drop), the
-/// carrier dies, or this timeout (a backstop for the deliver-and-survive case
-/// the demo gives us no clean end-signal for).
-const URN_PICKUP_RADIUS: f32 = 350.0;
-const URN_CARRY_MAX_TICKS: i32 = 90 * 64;
+const IDOL_RETURN_CLASS: &str = "CCitadelIdolReturnTrigger";
+
+fn pawn_index(entities: &boon::EntityContainer, handle: Option<u32>) -> Option<i32> {
+    entities
+        .get_by_handle(handle?)
+        .filter(|entity| entity.class_name.as_ref() == PAWN_CLASS)
+        .map(|entity| entity.id().index)
+}
 
 /// Every current hero exposes four ESlot_Signature_N abilities. The network
 /// vector has eight storage slots, but unused trailing slots can retain a
@@ -82,6 +107,28 @@ const ABILITY_UPGRADE_SLOTS: usize = 8;
 /// The game clears the Rift location to FLT_MAX when it resolves. This sanity
 /// bound rejects that finite sentinel and any other implausible map coordinate.
 const RIFT_COORD_SANITY: f32 = 1.0e6;
+
+#[derive(Deserialize)]
+struct EmbeddedCatalogNames {
+    heroes: HashMap<i64, String>,
+    abilities: HashMap<u32, String>,
+    ability_display_names: HashMap<String, String>,
+    modifiers: HashMap<u32, String>,
+    breakables: HashMap<u32, String>,
+}
+
+fn catalog_names() -> Result<boon::CatalogNames, JsError> {
+    let names: EmbeddedCatalogNames =
+        serde_json::from_str(include_str!("../catalog-names.json"))
+            .map_err(|error| JsError::new(&format!("invalid embedded Boon catalog: {error}")))?;
+    Ok(boon::CatalogNames {
+        heroes: names.heroes,
+        abilities: names.abilities,
+        ability_display_names: names.ability_display_names,
+        modifiers: names.modifiers,
+        breakables: names.breakables,
+    })
+}
 
 fn rift_xy(location: Option<[f32; 3]>) -> (Option<f32>, Option<f32>) {
     location
@@ -120,6 +167,14 @@ fn objective_kind(class_name: &str) -> &'static str {
     }
 }
 
+fn objective_kill_action(kind: &str, phase: Option<i64>) -> &'static str {
+    match (kind, phase) {
+        ("patron", Some(0 | 2)) => "phase_one_destroyed",
+        ("mid_boss", _) => "killed",
+        _ => "destroyed",
+    }
+}
+
 /// Whether a damage-matrix `source_name` is one of Valve's coarse damage-type
 /// buckets (`Bullet`/`Ability`/`Melee`/`Misc`/`UnknownAbility`) rather than a
 /// specific source. Coarse buckets use Capitalized display names; specific
@@ -145,9 +200,20 @@ struct SnapshotStat {
     creep_kills: u32,
     neutral_kills: u32,
     player_damage: u32,
-    player_healing: u32,
     denies: u32,
     ability_points: u32,
+    player_healing: Option<u32>,
+    self_healing: Option<u32>,
+    teammate_healing: Option<u32>,
+    player_damage_taken: Option<u32>,
+    creep_damage: Option<u32>,
+    neutral_damage: Option<u32>,
+    boss_damage: Option<u32>,
+    damage_absorbed: Option<u32>,
+    damage_mitigated: Option<u32>,
+    heal_prevented: Option<u32>,
+    heal_lost: Option<u32>,
+    possible_creeps: Option<u32>,
     // Per-source souls (gold + soul orbs) from `gold_sources`, for the player
     // souls-by-source view. `souls_other` lumps the rare item/ability sources.
     souls_players: u32,
@@ -190,6 +256,33 @@ struct SummaryResult {
     damage_matrix: Vec<DamagePair>,
     /// Per (hero, coarse category) cumulative damage series (Graph view).
     damage_by_source: Vec<DamageSourceSeries>,
+    healing_by_source: Vec<DamageSourceSeries>,
+    regen_by_source: Vec<DamageSourceSeries>,
+    assigned_lanes: Vec<LaneAssignment>,
+}
+
+#[derive(Serialize)]
+struct LaneAssignment {
+    hero_id: u32,
+    lane: Option<u32>,
+}
+
+#[derive(Clone, PartialEq, Eq, Hash, Serialize)]
+struct PlayerStatusResult {
+    states: Option<Vec<String>>,
+    enabled_states: Option<Vec<String>>,
+    disabled_states: Option<Vec<String>>,
+    unknown_states: Vec<u32>,
+    unknown_enabled_states: Vec<u32>,
+    unknown_disabled_states: Vec<u32>,
+}
+
+#[derive(Serialize)]
+struct PlayerDetailsResult {
+    hero_stats: boon::hero_stats::StatResult,
+    ability_stats: boon::ability_stats::AbilityStatResult,
+    imbues: boon::ability_stats::ImbueResult,
+    status: Option<PlayerStatusResult>,
 }
 
 #[wasm_bindgen]
@@ -198,7 +291,168 @@ impl DemoParser {
     pub fn new(bytes: Vec<u8>) -> Result<DemoParser, JsError> {
         let inner = boon::Parser::from_bytes(bytes);
         inner.verify().map_err(to_js_error)?;
-        Ok(Self { inner })
+        Ok(Self {
+            inner,
+            stat_catalog: None,
+            state_catalog: None,
+            stat_replay: None,
+            pickup_catalog: None,
+        })
+    }
+
+    /// Load one matching boon-data snapshot for browser-side stat queries.
+    #[wasm_bindgen(js_name = loadCatalog)]
+    pub fn load_catalog(
+        &mut self,
+        heroes: Vec<u8>,
+        abilities: Vec<u8>,
+        modifiers: Vec<u8>,
+        misc: Vec<u8>,
+    ) -> Result<(), JsError> {
+        let stat_catalog =
+            boon::hero_stats::StatCatalog::from_json_bytes(&heroes, &abilities, &modifiers, &misc)
+                .map_err(|error| JsError::new(&error.to_string()))?;
+        let state_catalog = boon::player_states::StateCatalog::from_json_bytes(&modifiers)
+            .map_err(|error| JsError::new(&error.to_string()))?;
+        let pickup_catalog = pickups::Catalog::load(&modifiers, &misc)
+            .map_err(|error| JsError::new(&error.to_string()))?;
+        self.stat_catalog = Some(stat_catalog);
+        self.state_catalog = Some(state_catalog);
+        self.pickup_catalog = Some(pickup_catalog);
+        self.stat_replay = None;
+        Ok(())
+    }
+
+    /// Prepare bounded exact stat checkpoints once, before interactive seeks.
+    #[wasm_bindgen(js_name = prepareStats)]
+    pub fn prepare_stats(&mut self) -> Result<bool, JsError> {
+        if let Some(replay) = &self.stat_replay {
+            return Ok(!replay.is_empty());
+        }
+        let catalog = self
+            .stat_catalog
+            .as_ref()
+            .ok_or_else(|| JsError::new("load a catalog first"))?;
+        // Bound decoded state retained for interactive queries.
+        let replay = self
+            .inner
+            .prepare_stat_replay(catalog, 16)
+            .map_err(to_js_error)?;
+        let prepared = !replay.is_empty();
+        self.stat_replay = Some(replay);
+        Ok(prepared)
+    }
+
+    /// Calculate the selected player's exact stats, imbues and recorded state
+    /// masks after one demo tick. Explanations are retained for UI tooltips.
+    #[wasm_bindgen(js_name = playerDetails)]
+    pub fn player_details(&self, tick: i32, steam_id: String) -> Result<JsValue, JsError> {
+        use boon::ability_stats::{AbilityRuleset, AbilityStat, AbilityStatQuery, ImbueQuery};
+        use boon::hero_stats::{HeroStat, HeroStatQuery, Ruleset, StatBatch, StatMode};
+        use boon::player_states::PlayerStateQuery;
+
+        let steam_id = steam_id
+            .parse::<u64>()
+            .map_err(|_| JsError::new("invalid Steam ID"))?;
+        let catalog = self
+            .stat_catalog
+            .as_ref()
+            .ok_or_else(|| JsError::new("load a boon-data catalog first"))?;
+        let state_catalog = self
+            .state_catalog
+            .as_ref()
+            .ok_or_else(|| JsError::new("load a boon-data state catalog first"))?;
+        let hero_stats = [
+            HeroStat::ClipSize,
+            HeroStat::BulletVelocity,
+            HeroStat::MeleeDistance,
+            HeroStat::ReloadTime,
+            HeroStat::FireRate,
+            HeroStat::FalloffStart,
+            HeroStat::FalloffEnd,
+            HeroStat::LightMeleeDamage,
+            HeroStat::HeavyMeleeDamage,
+            HeroStat::SlideDistance,
+            HeroStat::BulletEvasion,
+            HeroStat::DebuffResist,
+            HeroStat::WeaponDamage,
+            HeroStat::BulletResist,
+            HeroStat::SpiritResist,
+            HeroStat::MeleeResist,
+            HeroStat::BulletLifesteal,
+            HeroStat::SpiritLifesteal,
+            HeroStat::MeleeLifesteal,
+            HeroStat::GravityScale,
+            HeroStat::Stamina,
+            HeroStat::StaminaCooldown,
+            HeroStat::DashSpeed,
+            HeroStat::DashDuration,
+            HeroStat::AirDashSpeed,
+            HeroStat::AirDashDuration,
+            HeroStat::MoveSpeed,
+            HeroStat::SprintSpeed,
+        ];
+        let hero_rules = hero_stats
+            .iter()
+            .fold(Ruleset::new(), |rules, stat| rules.with(stat.rule()));
+        let hero_query = HeroStatQuery::new([tick], hero_stats)
+            .mode(StatMode::Current)
+            .steam_ids([steam_id])
+            .explain(true)
+            .strict(false);
+        let ability_rules = AbilityStat::ALL
+            .iter()
+            .fold(AbilityRuleset::new(), |rules, stat| rules.with(stat.rule()));
+        let ability_query = AbilityStatQuery::new([tick], AbilityStat::ALL)
+            .mode(StatMode::Current)
+            .steam_ids([steam_id])
+            .explain(true)
+            .strict(false);
+        let imbue_query = ImbueQuery::new([tick]).steam_ids([steam_id]);
+        let batch = StatBatch::new()
+            .hero_stats(&hero_query, &hero_rules)
+            .ability_stats(&ability_query, &ability_rules)
+            .imbues(&imbue_query);
+        let stats = match &self.stat_replay {
+            Some(replay) => self
+                .inner
+                .calculate_stats_with_replay(&batch, catalog, replay),
+            None => self.inner.calculate_stats(&batch, catalog),
+        };
+        let stats = stats.map_err(to_js_error)?;
+        let boon::hero_stats::StatBatchResult {
+            hero_stats: Some(hero_stats),
+            ability_stats: Some(ability_stats),
+            imbues: Some(imbues),
+        } = stats
+        else {
+            return Err(JsError::new("Boon omitted a requested stat dataset"));
+        };
+
+        let status = self
+            .inner
+            .player_states(
+                &PlayerStateQuery::default()
+                    .ticks([tick])
+                    .steam_ids([steam_id]),
+                state_catalog,
+            )
+            .map_err(|error| JsError::new(&error.to_string()))?
+            .into_iter()
+            .next()
+            .map(PlayerStatusResult::from);
+
+        let result = PlayerDetailsResult {
+            hero_stats,
+            ability_stats,
+            imbues,
+            status,
+        };
+        let serializer =
+            serde_wasm_bindgen::Serializer::new().serialize_large_number_types_as_bigints(true);
+        result
+            .serialize(&serializer)
+            .map_err(|error| JsError::new(&error.to_string()))
     }
 
     #[wasm_bindgen(js_name = fileHeader)]
@@ -230,6 +484,9 @@ impl DemoParser {
         let mut damage_sample_times: Vec<u32> = Vec::new();
         let mut damage_matrix: Vec<DamagePair> = Vec::new();
         let mut damage_by_source: Vec<DamageSourceSeries> = Vec::new();
+        let mut healing_by_source = Vec::new();
+        let mut regen_by_source = Vec::new();
+        let mut assigned_lanes = Vec::new();
         for event in &events {
             if event.msg_type != Msg::KEUserMsgPostMatchDetails as u32 {
                 continue;
@@ -249,6 +506,10 @@ impl DemoParser {
             };
             for player in &match_info.players {
                 let hero_id = player.hero_id();
+                assigned_lanes.push(LaneAssignment {
+                    hero_id,
+                    lane: player.assigned_lane,
+                });
                 for st in &player.stats {
                     // Souls per source = gold + orbs, keyed by the EGoldSource
                     // enum (1=players, 2=lane, 3=neutrals, 4=bosses, 5=treasure,
@@ -270,9 +531,20 @@ impl DemoParser {
                         creep_kills: st.creep_kills(),
                         neutral_kills: st.neutral_kills(),
                         player_damage: st.player_damage(),
-                        player_healing: st.player_healing(),
                         denies: st.denies(),
                         ability_points: st.ability_points(),
+                        player_healing: st.player_healing,
+                        self_healing: st.self_healing,
+                        teammate_healing: st.teammate_healing,
+                        player_damage_taken: st.player_damage_taken,
+                        creep_damage: st.creep_damage,
+                        neutral_damage: st.neutral_damage,
+                        boss_damage: st.boss_damage,
+                        damage_absorbed: st.damage_absorbed,
+                        damage_mitigated: st.damage_mitigated,
+                        heal_prevented: st.heal_prevented,
+                        heal_lost: st.heal_lost,
+                        possible_creeps: st.possible_creeps,
                         souls_players: by[1],
                         souls_lane: by[2],
                         souls_neutral: by[3],
@@ -286,87 +558,18 @@ impl DemoParser {
                 }
             }
 
-            // --- Damage matrix → hero-vs-hero totals + by-source series ----
-            // Per (dealer, source, target) the matrix stores a cumulative,
-            // right-aligned `damage` array over `sample_time_s`. Each hit is
-            // recorded under both a coarse category and a specific source:
-            // categories feed the by-source bands (clean handful of buckets),
-            // specific sources feed the hero-vs-hero totals (no double-count).
             if let Some(matrix) = &match_info.damage_matrix {
-                let times = &matrix.sample_time_s;
-                let n = times.len();
-                damage_sample_times = times.clone();
-                let slot_to_hero: HashMap<u32, u32> = match_info
+                let slot_to_hero = match_info
                     .players
                     .iter()
                     .filter_map(|p| p.player_slot.map(|slot| (slot, p.hero_id())))
                     .collect();
-                let (names, stats): (&[String], &[i32]) = match matrix.source_details.as_ref() {
-                    Some(sd) => (sd.source_name.as_slice(), sd.stat_type.as_slice()),
-                    None => (&[], &[]),
-                };
-                let mut pair_totals: HashMap<(u32, u32), u32> = HashMap::new();
-                let mut series: HashMap<(u32, String), Vec<u32>> = HashMap::new();
-                for dealer in &matrix.damage_dealers {
-                    let Some(&dhero) = slot_to_hero.get(&dealer.dealer_player_slot()) else {
-                        continue;
-                    };
-                    if dhero == 0 {
-                        continue;
-                    }
-                    for source in &dealer.damage_sources {
-                        let idx = source.source_details_index() as usize;
-                        // EStatType: 0 = damage. The Matrix/by-source views are
-                        // about hero damage only.
-                        if stats.get(idx).copied().unwrap_or(0) != 0 {
-                            continue;
-                        }
-                        let name = names.get(idx).cloned().unwrap_or_default();
-                        let category = is_category_source(&name);
-                        for dtp in &source.damage_to_players {
-                            let arr = &dtp.damage;
-                            if arr.is_empty() {
-                                continue;
-                            }
-                            // Cumulative arrays cover the last `arr.len()` samples.
-                            let start = n.saturating_sub(arr.len());
-                            if category {
-                                let s = series
-                                    .entry((dhero, name.clone()))
-                                    .or_insert_with(|| vec![0u32; n]);
-                                for (k, &cum) in arr.iter().enumerate() {
-                                    let i = start + k;
-                                    if i < s.len() {
-                                        s[i] = s[i].saturating_add(cum);
-                                    }
-                                }
-                            } else if let Some(&thero) = slot_to_hero.get(&dtp.target_player_slot())
-                            {
-                                // Final cumulative value = total for this pair.
-                                if thero != 0 {
-                                    *pair_totals.entry((dhero, thero)).or_insert(0) +=
-                                        arr.last().copied().unwrap_or(0);
-                                }
-                            }
-                        }
-                    }
-                }
-                damage_matrix = pair_totals
-                    .into_iter()
-                    .map(|((dealer_hero, target_hero), damage)| DamagePair {
-                        dealer_hero,
-                        target_hero,
-                        damage,
-                    })
-                    .collect();
-                damage_by_source = series
-                    .into_iter()
-                    .map(|((hero_id, source), values)| DamageSourceSeries {
-                        hero_id,
-                        source,
-                        values,
-                    })
-                    .collect();
+                let totals = summary::matrix(matrix, &slot_to_hero).map_err(JsError::new)?;
+                damage_sample_times = matrix.sample_time_s.clone();
+                damage_matrix = totals.damage;
+                damage_by_source = totals.sources;
+                healing_by_source = totals.healing;
+                regen_by_source = totals.regen;
             }
 
             break; // a single PostMatchDetails carries the whole match
@@ -376,6 +579,9 @@ impl DemoParser {
             damage_sample_times,
             damage_matrix,
             damage_by_source,
+            healing_by_source,
+            regen_by_source,
+            assigned_lanes,
         })
         .map_err(|e| JsError::new(&e.to_string()))
     }
@@ -394,6 +600,18 @@ impl DemoParser {
         sample_every: u32,
         progress: &js_sys::Function,
     ) -> Result<JsValue, JsError> {
+        let names = catalog_names()?;
+        let catalog = self
+            .stat_catalog
+            .as_ref()
+            .ok_or_else(|| JsError::new("load a boon-data catalog first"))?;
+        let initial = self.inner.parse_init().map_err(to_js_error)?;
+        let barriers = barriers::Barriers::read(&self.inner).map_err(to_js_error)?;
+        let pickup_catalog = self
+            .pickup_catalog
+            .as_ref()
+            .ok_or_else(|| JsError::new("load a boon-data catalog first"))?;
+        let mut pickup_history = pickups::History::default();
         // Every ability a hero owns is its own networked entity — one class per
         // ability (hundreds total). To track per-ability cooldowns we must decode
         // them all; their class names come from the send tables (any class whose
@@ -417,6 +635,7 @@ impl DemoParser {
             NEUTRAL_CLASS,
             TROOPER_CLASS,
             IDOL_CLASS,
+            IDOL_RETURN_CLASS,
             BREAKABLE_CLASS,
         ]
         .into_iter()
@@ -453,13 +672,15 @@ impl DemoParser {
         let mut pk_life: Option<u64> = None;
         let mut pk_health: Option<u64> = None;
         let mut pk_max_health: Option<u64> = None;
-        let mut pk_simulation_time: Option<u64> = None;
         // m_angEyeAngles: QAngle(pitch, yaw, roll) — the hero's look direction.
         let mut pk_eye: Option<u64> = None;
 
         // Controller keys
         let mut ctrl_keys_resolved = false;
         let mut ck_hero: Option<u64> = None;
+        let mut ck_hero_pawn: Option<u64> = None;
+        let mut ck_pawn: Option<u64> = None;
+        let mut ck_steam: Option<u64> = None;
         let mut ck_team: Option<u64> = None;
         let mut ck_name: Option<u64> = None;
         let mut ck_rank: Option<u64> = None;
@@ -469,13 +690,8 @@ impl DemoParser {
         let mut ck_deaths: Option<u64> = None;
         let mut ck_assists: Option<u64> = None;
         let mut ck_damage: Option<u64> = None;
-        let mut ck_healing: Option<u64> = None;
         let mut ck_objective_damage: Option<u64> = None;
         let mut ck_health_max: Option<u64> = None;
-        // (eValType key, value key) pairs for the 20 stat-modifier slots on
-        // m_PlayerDataGlobal.m_vecStatViewerModifierValues.
-        let mut ck_stat_count: Option<u64> = None;
-        let mut ck_stat_keys: Vec<(Option<u64>, Option<u64>)> = Vec::with_capacity(20);
         // (m_ItemID key, m_nUpgradeInfo key) pairs for the four signature slots
         // on m_PlayerDataGlobal.m_vecAbilityUpgradeState.
         let mut ck_ability_keys: Vec<(Option<u64>, Option<u64>)> =
@@ -510,10 +726,11 @@ impl DemoParser {
         // capture a constant roster (kind/team/position/max_health, keyed by
         // entity index) plus sparse health samples — health is recorded only
         // when it changes at a sampled tick, like items/ability upgrades. Death
-        // ticks come from BossKilled. Field keys are resolved once per class.
+        // ticks come from BossKilled or final Patron lifestate. Its first kill
+        // is a transformation, not removal. Field keys resolve once per class.
         let mut obj_keys: HashMap<&'static str, ObjKeys> = HashMap::new();
         let mut obj_roster: HashMap<i32, ObjectiveBuild> = HashMap::new();
-        let mut obj_last_hp: HashMap<i32, (i32, i32)> = HashMap::new();
+        let mut obj_last_hp = HashMap::new();
         let mut obj_health_events: Vec<ObjectiveHealthEvent> = Vec::new();
         let mut obj_death_tick: HashMap<i32, i32> = HashMap::new();
 
@@ -549,6 +766,7 @@ impl DemoParser {
         let mut tk_vec_y: Option<u64> = None;
         let mut tk_team: Option<u64> = None;
         let mut tk_life: Option<u64> = None;
+        let mut tk_max_health: Option<u64> = None;
 
         // Urn (Idol) spawn tracking. Position keys resolved once; a per-tick
         // "present last tick" set turns a newly-appearing idol entity into one
@@ -559,12 +777,17 @@ impl DemoParser {
         let mut idk_cell_y: Option<u64> = None;
         let mut idk_vec_y: Option<u64> = None;
         let mut idk_team: Option<u64> = None;
-        let mut idol_prev: HashSet<i32> = HashSet::new();
-        let mut idol_now: HashSet<i32> = HashSet::new();
-        let mut idol_last_pos: HashMap<i32, (f32, f32)> = HashMap::new();
-        // The pawn currently carrying the urn (entity despawned), or None.
-        let mut carrier_pawn: Option<i32> = None;
-        let mut carry_start: i32 = 0;
+        let mut idol_prev: HashSet<boon::EntityId> = HashSet::new();
+        let mut idol_now: HashSet<boon::EntityId> = HashSet::new();
+        let mut urn_state = boon::urn::UrnState::with_catalog(catalog)
+            .map_err(|error| JsError::new(&error.to_string()))?;
+        let mut carrier_pawns: HashSet<u32> = HashSet::new();
+        let mut carrier_positions: HashMap<u32, (i64, i32, f32, f32)> = HashMap::new();
+        let mut urn_events: Vec<ObjectiveEvent> = Vec::new();
+        let return_schema = initial.serializers().get(IDOL_RETURN_CLASS);
+        let return_disabled = return_schema.and_then(|s| s.resolve_field_key("m_bDisabled"));
+        let return_team = return_schema.and_then(|s| s.resolve_field_key("m_iTeamNum"));
+        let mut return_previous: HashMap<boon::EntityId, (bool, i64)> = HashMap::new();
 
         // Ability upgrades are stored as a sparse event log rather than on every
         // frame (each hero's 4 abilities only change a dozen times a match). The
@@ -602,25 +825,18 @@ impl DemoParser {
         let mut regulation_ticks: Option<i32> = None;
 
         // --- Active modifiers (buffs / debuffs) ---------------------------
-        // The networked "ActiveModifiers" string table holds one
-        // CModifierTableEntry per live modifier instance, delta-updated each
-        // tick. We diff it by serial number (mirroring boon-python's
-        // `active_modifiers`) and emit one span [start_tick, end_tick) per
-        // modifier applied to a player pawn. Each span is labeled by its
+        // Boon merges ordered modifier writes, ignores table snapshots, and
+        // applies shared catalog lifetime rules. Emit one span [start, end)
+        // per visible state of each application. Each span is labeled by its
         // *source* ability/item (`ability_subclass` resolves far more often
         // than the modifier's own subclass) with the modifier's own name as a
         // secondary label; spans that resolve to neither are dropped. Reading
         // the string table is independent of the entity class filter.
-        let mut modifier_state = boon::EffectiveModifierState::default();
-        let mut barrier_modifier_state = boon::ModifierState::default();
+        let mut modifier_state = boon::EffectiveModifierState::with_catalog(catalog);
+        let modifier_clock = boon::ModifierClock::resolve(&initial);
+        modifier_state.rebuild(&initial, modifier_clock.game_time(&initial));
         let mut mod_open: HashMap<u32, OpenModifier> = HashMap::new();
         let mut modifier_spans: Vec<ModifierSpan> = Vec::new();
-        let mut modifier_seen: HashSet<(i64, u32)> = HashSet::new();
-        let mut suppressed_modifier_serials: HashSet<u32> = HashSet::new();
-        // Barrier is not a pawn send-table field. Its persistent tracker uses
-        // float1 for capacity and float2 for current remaining barrier.
-        let mut barrier_by_pawn: HashMap<i32, f32> = HashMap::new();
-        let mut barrier_serial_pawn: HashMap<u32, i32> = HashMap::new();
 
         // --- Ability cooldowns (per-ability entity state) -----------------
         // Each ability entity carries cooldown/charge fields; we diff them every
@@ -640,7 +856,7 @@ impl DemoParser {
         let mut ability_keys_cache: HashMap<String, AbilityKeys> = HashMap::new();
         // entity idx → last (cooldown_start, cooldown_end, remaining_charges,
         // recharge_start, recharge_end), for change detection.
-        let mut abil_prev: HashMap<i32, (f32, f32, i32, f32, f32)> = HashMap::new();
+        let mut abil_prev: HashMap<boon::EntityId, (f32, f32, i32, f32, f32)> = HashMap::new();
         let mut ability_ticks: Vec<AbilityTick> = Vec::new();
 
         use boon_proto::proto::{CitadelUserMessageIds as Msg, ECitadelGameEvents};
@@ -808,89 +1024,6 @@ impl DemoParser {
                     }
                 }
 
-                // Resolve the Urn's position keys once it first appears.
-                if !idol_keys_resolved && let Some(s) = ctx.serializers().get(IDOL_CLASS) {
-                    let o = "CBodyComponent.m_skeletonInstance.m_vecOrigin";
-                    idk_cell_x = s.resolve_field_key(&format!("{o}.m_cellX"));
-                    idk_vec_x = s.resolve_field_key(&format!("{o}.m_vecX"));
-                    idk_cell_y = s.resolve_field_key(&format!("{o}.m_cellY"));
-                    idk_vec_y = s.resolve_field_key(&format!("{o}.m_vecY"));
-                    idk_team = s.resolve_field_key("m_iTeamNum");
-                    idol_keys_resolved = true;
-                }
-
-                // Urn lifecycle. A newly-seen idol entity is either a fresh
-                // spawn (emit the "urn" objective event) or the urn being
-                // dropped back into the world by the player who was carrying it
-                // (no event — just end the carry). An idol that vanishes next to
-                // a living hero was picked up by that hero.
-                idol_now.clear();
-                for (idx, e) in ctx.entities().iter() {
-                    if e.class_name.as_ref() != IDOL_CLASS {
-                        continue;
-                    }
-                    idol_now.insert(idx);
-                    let ux =
-                        boon::cell_to_world(get_i64(e, idk_cell_x) as i32, get_f32(e, idk_vec_x));
-                    let uy =
-                        boon::cell_to_world(get_i64(e, idk_cell_y) as i32, get_f32(e, idk_vec_y));
-                    idol_last_pos.insert(idx, (ux, uy));
-                    if !idol_prev.contains(&idx) {
-                        if carrier_pawn.is_some() {
-                            // The carried urn reappeared → it was dropped, not a
-                            // fresh spawn.
-                            carrier_pawn = None;
-                        } else {
-                            objective_events_raw.push(RawObjectiveEvent {
-                                tick: ctx.tick(),
-                                kind: "urn",
-                                action: "spawns",
-                                team: get_i64(e, idk_team) as i32,
-                                killer_pawn: -1,
-                                x: Some(ux),
-                                y: Some(uy),
-                            });
-                        }
-                    }
-                }
-                // Pickups: an idol that despawned next to a living pawn.
-                for &idx in idol_prev.iter() {
-                    if idol_now.contains(&idx) {
-                        continue;
-                    }
-                    let (lx, ly) = idol_last_pos.remove(&idx).unwrap_or((0.0, 0.0));
-                    let mut best = (f32::MAX, -1i32);
-                    for (pidx, pe) in ctx.entities().iter() {
-                        if pe.class_name.as_ref() != PAWN_CLASS || get_i64(pe, pk_life) != 0 {
-                            continue;
-                        }
-                        let x =
-                            boon::cell_to_world(get_i64(pe, pk_cell_x) as i32, get_f32(pe, pk_x));
-                        let y =
-                            boon::cell_to_world(get_i64(pe, pk_cell_y) as i32, get_f32(pe, pk_y));
-                        let d = ((x - lx).powi(2) + (y - ly).powi(2)).sqrt();
-                        if d < best.0 {
-                            best = (d, pidx);
-                        }
-                    }
-                    if best.0 < URN_PICKUP_RADIUS {
-                        carrier_pawn = Some(best.1);
-                        carry_start = ctx.tick();
-                    }
-                }
-                std::mem::swap(&mut idol_prev, &mut idol_now);
-                // End a carry when the carrier dies / disappears, or the backstop
-                // timeout elapses.
-                if let Some(cp) = carrier_pawn {
-                    let ended = match ctx.entities().get(cp) {
-                        Some(e) if e.class_name.as_ref() == PAWN_CLASS => get_i64(e, pk_life) != 0,
-                        _ => true,
-                    } || ctx.tick().saturating_sub(carry_start) > URN_CARRY_MAX_TICKS;
-                    if ended {
-                        carrier_pawn = None;
-                    }
-                }
-
                 if !pawn_keys_resolved && let Some(s) = ctx.serializers().get(PAWN_CLASS) {
                     let origin = "CBodyComponent.m_skeletonInstance.m_vecOrigin";
                     pk_x = s.resolve_field_key(&format!("{origin}.m_vecX"));
@@ -905,13 +1038,51 @@ impl DemoParser {
                     pk_life = s.resolve_field_key("m_lifeState");
                     pk_health = s.resolve_field_key("m_iHealth");
                     pk_max_health = s.resolve_field_key("m_iMaxHealth");
-                    pk_simulation_time = s.resolve_field_key("m_flSimulationTime");
                     pk_eye = s.resolve_field_key("m_angEyeAngles");
                     pawn_keys_resolved = true;
                 }
+                // Resolve the Urn's position keys once it first appears.
+                if !idol_keys_resolved && let Some(s) = ctx.serializers().get(IDOL_CLASS) {
+                    let o = "CBodyComponent.m_skeletonInstance.m_vecOrigin";
+                    idk_cell_x = s.resolve_field_key(&format!("{o}.m_cellX"));
+                    idk_vec_x = s.resolve_field_key(&format!("{o}.m_vecX"));
+                    idk_cell_y = s.resolve_field_key(&format!("{o}.m_cellY"));
+                    idk_vec_y = s.resolve_field_key(&format!("{o}.m_vecY"));
+                    idk_team = s.resolve_field_key("m_iTeamNum");
+                    idol_keys_resolved = true;
+                }
+
+                // World entities supply spawn locations, not carrier identity.
+                // Boon's holding-modifier transitions below distinguish carries.
+                idol_now.clear();
+                for (_, e) in ctx.entities().iter() {
+                    if !e.active || e.class_name.as_ref() != IDOL_CLASS {
+                        continue;
+                    }
+                    idol_now.insert(e.id());
+                    let ux =
+                        boon::cell_to_world(get_i64(e, idk_cell_x) as i32, get_f32(e, idk_vec_x));
+                    let uy =
+                        boon::cell_to_world(get_i64(e, idk_cell_y) as i32, get_f32(e, idk_vec_y));
+                    if !idol_prev.contains(&e.id()) && carrier_pawns.is_empty() {
+                        objective_events_raw.push(RawObjectiveEvent {
+                            tick: ctx.tick(),
+                            kind: "urn",
+                            action: "spawns",
+                            team: get_i64(e, idk_team) as i32,
+                            killer_pawn: -1,
+                            x: Some(ux),
+                            y: Some(uy),
+                        });
+                    }
+                }
+                std::mem::swap(&mut idol_prev, &mut idol_now);
 
                 if !ctrl_keys_resolved && let Some(s) = ctx.serializers().get(CONTROLLER_CLASS) {
                     ck_hero = s.resolve_field_key("m_PlayerDataGlobal.m_nHeroID");
+                    ck_hero_pawn = s.resolve_field_key("m_hHeroPawn");
+                    ck_pawn = s.resolve_field_key("m_hPawn");
+                    ck_steam = s.resolve_field_key("m_steamID");
                     ck_team = s.resolve_field_key("m_iTeamNum");
                     ck_name = s.resolve_field_key("m_iszPlayerName");
                     ck_rank = s.resolve_field_key("m_PlayerDataGlobal.m_unPackedRank");
@@ -921,7 +1092,6 @@ impl DemoParser {
                     ck_deaths = s.resolve_field_key("m_PlayerDataGlobal.m_iDeaths");
                     ck_assists = s.resolve_field_key("m_PlayerDataGlobal.m_iPlayerAssists");
                     ck_damage = s.resolve_field_key("m_PlayerDataGlobal.m_iHeroDamage");
-                    ck_healing = s.resolve_field_key("m_PlayerDataGlobal.m_iHeroHealing");
                     ck_objective_damage =
                         s.resolve_field_key("m_PlayerDataGlobal.m_iObjectiveDamage");
                     // Effective max health. The pawn's m_iMaxHealth is a base/
@@ -929,17 +1099,6 @@ impl DemoParser {
                     // controller's m_iHealthMax already folds in level growth,
                     // items and buffs, so it's the correct denominator.
                     ck_health_max = s.resolve_field_key("m_PlayerDataGlobal.m_iHealthMax");
-                    ck_stat_count =
-                        s.resolve_field_key("m_PlayerDataGlobal.m_vecStatViewerModifierValues");
-                    for i in 0..20usize {
-                        let vt = s.resolve_field_key(&format!(
-                            "m_PlayerDataGlobal.m_vecStatViewerModifierValues.{i}.m_eValType"
-                        ));
-                        let val = s.resolve_field_key(&format!(
-                            "m_PlayerDataGlobal.m_vecStatViewerModifierValues.{i}.m_flValue"
-                        ));
-                        ck_stat_keys.push((vt, val));
-                    }
                     for i in 0..ABILITY_UPGRADE_SLOTS {
                         let item = s.resolve_field_key(&format!(
                             "m_PlayerDataGlobal.m_vecAbilityUpgradeState.{i:04}.m_ItemID"
@@ -979,6 +1138,16 @@ impl DemoParser {
                             continue;
                         }
                         let hero_id = get_i64(entity, ck_hero);
+                        let steam_id = get_i64(entity, ck_steam);
+                        if let Some(serializer) = ctx.serializers().get(CONTROLLER_CLASS) {
+                            pickup_history.record(
+                                entity,
+                                serializer,
+                                pickup_catalog,
+                                steam_id.max(0) as u64,
+                                ctx.tick(),
+                            );
+                        }
                         if hero_id != 0 {
                             slot_to_hero.insert(idx - 1, hero_id);
                         }
@@ -987,6 +1156,7 @@ impl DemoParser {
                         let rank = get_i64(entity, ck_rank);
                         let entry = roster.entry(idx).or_insert_with(|| PlayerInfo {
                             name: String::new(),
+                            steam_id: String::new(),
                             hero_id: 0,
                             hero_name: String::new(),
                             team: 0,
@@ -995,9 +1165,12 @@ impl DemoParser {
                         if !name.is_empty() {
                             entry.name = name;
                         }
+                        if steam_id > 0 {
+                            entry.steam_id = steam_id.to_string();
+                        }
                         if hero_id > 0 && entry.hero_id != hero_id {
                             entry.hero_id = hero_id;
-                            entry.hero_name = boon::hero_name(hero_id).to_string();
+                            entry.hero_name = names.hero_name(hero_id).to_string();
                         }
                         if team != 0 {
                             entry.team = team;
@@ -1239,9 +1412,15 @@ impl DemoParser {
                                 .get(&killed_idx)
                                 .copied()
                                 .unwrap_or("objective");
-                            // Mark it dead for the live overlay (drop after this
-                            // tick). First death wins.
-                            obj_death_tick.entry(killed_idx).or_insert(event.tick);
+                            let phase = ctx.entities().get(killed_idx).and_then(|entity| {
+                                let serializer = ctx.serializers().get(&entity.class_name)?;
+                                let key = serializer.resolve_field_key("m_ePhase")?;
+                                Some(entity.get_i64(Some(key)))
+                            });
+                            let action = objective_kill_action(kind, phase);
+                            if action != "phase_one_destroyed" {
+                                obj_death_tick.entry(killed_idx).or_insert(event.tick);
+                            }
                             let killer_pawn =
                                 boon::protobuf_handle_index(msg.entity_killer).unwrap_or(-1);
                             let (x, y) = msg
@@ -1251,11 +1430,7 @@ impl DemoParser {
                             objective_events_raw.push(RawObjectiveEvent {
                                 tick: event.tick,
                                 kind,
-                                action: if kind == "mid_boss" {
-                                    "killed"
-                                } else {
-                                    "destroyed"
-                                },
+                                action,
                                 team: msg.objective_team.unwrap_or(-1),
                                 killer_pawn,
                                 x,
@@ -1294,97 +1469,97 @@ impl DemoParser {
                     }
                 }
 
-                // Barrier reflects the raw replicated table: its tracker uses
-                // float2 and is explicitly removed by the game.
-                for change in barrier_modifier_state.update(ctx) {
-                    let serial = change.serial;
-                    if change.kind == boon::ModifierChangeKind::Removed {
-                        if let Some(pawn) = barrier_serial_pawn.remove(&serial)
-                            && !barrier_serial_pawn.values().any(|other| *other == pawn)
-                        {
-                            barrier_by_pawn.remove(&pawn);
-                        }
+                let game_time = modifier_clock.game_time(ctx);
+                let changes = modifier_state.update(ctx, game_time);
+                let mut delivery_closed = false;
+                for &idx in ctx.entities().updated_indices() {
+                    let Some(entity) = ctx
+                        .entities()
+                        .get(idx)
+                        .filter(|e| e.class_name.as_ref() == IDOL_RETURN_CLASS)
+                    else {
+                        continue;
+                    };
+                    let Some(boon::FieldValue::Bool(disabled)) =
+                        return_disabled.and_then(|key| entity.fields.get(&key))
+                    else {
+                        continue;
+                    };
+                    if return_team.is_none_or(|key| !entity.fields.contains_key(&key)) {
                         continue;
                     }
-
-                    let m = &change.entry;
-                    if m.modifier_subclass == Some(BARRIER_TRACKER_MODIFIER_ID)
-                        && let Some(parent_idx) = boon::protobuf_handle_index(m.parent)
-                    {
-                        let remaining = m.float2.unwrap_or(0.0);
-                        barrier_by_pawn.insert(
-                            parent_idx,
-                            if remaining.is_finite() {
-                                remaining.max(0.0)
-                            } else {
-                                0.0
-                            },
-                        );
-                        if let Some(old_pawn) = barrier_serial_pawn.insert(serial, parent_idx)
-                            && old_pawn != parent_idx
-                            && !barrier_serial_pawn.values().any(|other| *other == old_pawn)
-                        {
-                            barrier_by_pawn.remove(&old_pawn);
-                        }
+                    let previous = return_previous
+                        .insert(entity.id(), (*disabled, get_i64(entity, return_team)));
+                    delivery_closed |=
+                        *disabled && previous.is_some_and(|(was_disabled, _)| !was_disabled);
+                }
+                // Keep a last observed position for an absent carrier's event;
+                // absence itself does not end a carry or transfer it to a reused slot.
+                let carrier_position = |handle| {
+                    ctx.entities()
+                        .get_by_handle(handle)
+                        .filter(|e| e.class_name.as_ref() == PAWN_CLASS)
+                        .map(|pawn| {
+                            (
+                                get_i64(pawn, pk_hero),
+                                get_i64(pawn, pk_team) as i32,
+                                boon::cell_to_world(
+                                    get_i64(pawn, pk_cell_x) as i32,
+                                    get_f32(pawn, pk_x),
+                                ),
+                                boon::cell_to_world(
+                                    get_i64(pawn, pk_cell_y) as i32,
+                                    get_f32(pawn, pk_y),
+                                ),
+                            )
+                        })
+                };
+                for &handle in &carrier_pawns {
+                    if let Some(position) = carrier_position(handle) {
+                        carrier_positions.insert(handle, position);
                     }
                 }
-
-                // Boon's effective state merges partial ActiveModifiers rows,
-                // honors aura exits, and expires finite modifiers against the
-                // Source 2 simulation clock even if Valve leaves a stale row.
-                let changes =
-                    modifier_state.update(ctx, current_simulation_time(ctx, pk_simulation_time));
-
-                // Some demo keyframes restamp many already-seen modifiers at
-                // the same tick. Match boon-python's conservative filter so
-                // those bookkeeping snapshots do not become duplicate UI rows.
-                let restamped_heroes: HashSet<i64> = changes
-                    .iter()
-                    .filter(|change| change.kind == boon::ModifierChangeKind::Applied)
-                    .filter_map(|change| {
-                        let modifier_id = change.entry.modifier_subclass?;
-                        let pawn = boon::protobuf_handle_index(change.entry.parent)?;
-                        let hero_id = *pawn_to_hero.get(&pawn)?;
-                        modifier_seen
-                            .contains(&(hero_id, modifier_id))
-                            .then_some(hero_id)
-                    })
-                    .collect();
-                let is_restamp = restamped_heroes.len() >= RESTAMP_MIN_REAPPLY_HEROES;
+                for change in urn_state.update(&changes, game_time, delivery_closed) {
+                    let position = carrier_position(change.parent)
+                        .or_else(|| carrier_positions.get(&change.parent).copied());
+                    if change.kind == boon::urn::UrnEventKind::PickedUp {
+                        carrier_pawns.insert(change.parent);
+                        if let Some(position) = position {
+                            carrier_positions.insert(change.parent, position);
+                        }
+                    } else {
+                        carrier_pawns.remove(&change.parent);
+                        carrier_positions.remove(&change.parent);
+                    }
+                    if let Some((hero_id, team, x, y)) =
+                        position.filter(|(hero, _, _, _)| *hero != 0)
+                    {
+                        urn_events.push(ObjectiveEvent {
+                            tick: ctx.tick(),
+                            kind: "urn".to_string(),
+                            action: change.kind.as_str().to_string(),
+                            team,
+                            killer_hero_id: hero_id,
+                            x: Some(x),
+                            y: Some(y),
+                        });
+                    }
+                }
 
                 for change in changes {
                     let serial = change.serial;
                     if change.kind == boon::ModifierChangeKind::Removed {
-                        suppressed_modifier_serials.remove(&serial);
                         if let Some(open) = mod_open.remove(&serial) {
                             modifier_spans.push(open.into_span(Some(ctx.tick())));
                         }
                         continue;
                     }
 
-                    let logical = change.entry.modifier_subclass.and_then(|modifier_id| {
-                        let pawn = boon::protobuf_handle_index(change.entry.parent)?;
-                        pawn_to_hero
-                            .get(&pawn)
-                            .map(|&hero_id| (hero_id, modifier_id))
-                    });
-                    if change.kind == boon::ModifierChangeKind::Applied {
-                        if is_restamp && logical.is_some_and(|key| modifier_seen.contains(&key)) {
-                            suppressed_modifier_serials.insert(serial);
-                            continue;
-                        }
-                        suppressed_modifier_serials.remove(&serial);
-                        if let Some(key) = logical {
-                            modifier_seen.insert(key);
-                        }
-                    } else if suppressed_modifier_serials.contains(&serial) {
-                        continue;
-                    }
-
                     let m = &change.entry;
-                    // Barrier has its own numeric UI and its tracker is an
-                    // implementation detail, not a player-facing modifier.
-                    if m.modifier_subclass == Some(BARRIER_TRACKER_MODIFIER_ID) {
+                    // Internal pool trackers are not player-facing effects.
+                    if m.modifier_subclass
+                        .is_some_and(|id| HIDDEN_MODIFIER_IDS.contains(&id))
+                    {
                         continue;
                     }
                     let Some(mut next) = OpenModifier::from_entry(
@@ -1392,7 +1567,9 @@ impl DemoParser {
                         m,
                         ctx.tick(),
                         active_ticks,
+                        ctx.entities(),
                         &pawn_to_hero,
+                        &names,
                     ) else {
                         continue;
                     };
@@ -1454,7 +1631,7 @@ impl DemoParser {
                     }
                     let hero_id = entity
                         .get_handle(keys.owner)
-                        .map(|h| (h & boon::ENTITY_HANDLE_INDEX_MASK) as i32)
+                        .and_then(|handle| pawn_index(ctx.entities(), Some(handle)))
                         .and_then(|owner_idx| pawn_to_hero.get(&owner_idx).copied())
                         .unwrap_or(0);
                     if hero_id == 0 {
@@ -1467,7 +1644,10 @@ impl DemoParser {
                         get_f32(entity, keys.recharge_start),
                         get_f32(entity, keys.recharge_end),
                     );
-                    let changed = abil_prev.get(&idx).map(|p| *p != state).unwrap_or(true);
+                    let changed = abil_prev
+                        .get(&entity.id())
+                        .map(|p| *p != state)
+                        .unwrap_or(true);
                     if changed {
                         ability_ticks.push(AbilityTick {
                             tick: ctx.tick(),
@@ -1480,7 +1660,7 @@ impl DemoParser {
                             charge_recharge_start: state.3,
                             charge_recharge_end: state.4,
                         });
-                        abil_prev.insert(idx, state);
+                        abil_prev.insert(entity.id(), state);
                     }
                 }
 
@@ -1509,11 +1689,21 @@ impl DemoParser {
                     let keys = &obj_keys[class];
                     let health = get_i64(entity, keys.health) as i32;
                     let max_health = get_i64(entity, keys.max_health) as i32;
+                    let phase = if class == "CNPC_Boss_Tier3" {
+                        keys.phase.map(|key| entity.get_i64(Some(key)) as i32)
+                    } else {
+                        None
+                    };
                     let team = get_i64(entity, keys.team) as i32;
                     let cx = get_i64(entity, keys.cell_x) as i32;
                     let cy = get_i64(entity, keys.cell_y) as i32;
                     let wx = boon::cell_to_world(cx, get_f32(entity, keys.vec_x));
                     let wy = boon::cell_to_world(cy, get_f32(entity, keys.vec_y));
+                    // The final Patron death may end the match without another
+                    // BossKilled message. Do not hide it at the phase-one kill.
+                    if phase == Some(1) && get_i64(entity, keys.life) != 0 {
+                        obj_death_tick.entry(idx).or_insert(ctx.tick());
+                    }
 
                     obj_roster.entry(idx).or_insert_with(|| ObjectiveBuild {
                         kind: objective_kind(&entity.class_name),
@@ -1524,14 +1714,18 @@ impl DemoParser {
                         spawn_tick: ctx.tick(),
                     });
 
-                    // Sparse health: record only when (health, max) changes.
-                    if max_health > 0 && obj_last_hp.get(&idx) != Some(&(health, max_health)) {
-                        obj_last_hp.insert(idx, (health, max_health));
+                    // Keep phase and position changes on the same entity ID.
+                    let state = (health, max_health, phase, wx.to_bits(), wy.to_bits());
+                    if max_health > 0 && obj_last_hp.get(&idx) != Some(&state) {
+                        obj_last_hp.insert(idx, state);
                         obj_health_events.push(ObjectiveHealthEvent {
                             tick: ctx.tick(),
                             id: idx,
                             health,
                             max_health,
+                            phase,
+                            x: wx,
+                            y: wy,
                         });
                     }
                 }
@@ -1549,24 +1743,23 @@ impl DemoParser {
                 }
                 if neutral_keys_resolved {
                     // Gather this tick's neutral creeps once.
-                    let mut neutrals: Vec<(i32, f32, f32, bool, u8)> = Vec::new();
+                    let mut neutrals: Vec<(i32, f32, f32, u8)> = Vec::new();
                     for (idx, e) in ctx.entities().iter() {
-                        if e.class_name.as_ref() != NEUTRAL_CLASS {
+                        if !is_live_npc(e, NEUTRAL_CLASS, nk_life, nk_max_health) {
                             continue;
                         }
                         let x =
                             boon::cell_to_world(get_i64(e, nk_cell_x) as i32, get_f32(e, nk_vec_x));
                         let y =
                             boon::cell_to_world(get_i64(e, nk_cell_y) as i32, get_f32(e, nk_vec_y));
-                        let alive = get_i64(e, nk_life) == 0;
                         let tier = neutral_tier(get_i64(e, nk_max_health) as i32);
-                        neutrals.push((idx, x, y, alive, tier));
+                        neutrals.push((idx, x, y, tier));
                     }
 
                     // Roster: cluster each creep's first-seen (≈ spawn) position.
                     // Spawn positions are exact, so clustering them is stable
                     // (live positions drift when creeps aggro).
-                    for &(idx, x, y, _, tier) in &neutrals {
+                    for &(idx, x, y, tier) in &neutrals {
                         if !seen_creeps.insert(idx) {
                             continue;
                         }
@@ -1594,10 +1787,7 @@ impl DemoParser {
 
                     // Occupancy: a live creep marks its nearest camp "up".
                     let mut occupied = vec![false; camps.len()];
-                    for &(_, x, y, alive, _) in &neutrals {
-                        if !alive {
-                            continue;
-                        }
+                    for &(_, x, y, _) in &neutrals {
                         if let Some(i) = nearest_camp(&camps, x, y) {
                             occupied[i] = true;
                         }
@@ -1614,9 +1804,7 @@ impl DemoParser {
                     }
                 }
 
-                // Build the controller state once per sampled frame. Boon 0.9
-                // intentionally exposes only the modifier contributions that
-                // the demo records; these are not inferred total hero stats.
+                // Build the controller state once per sampled frame.
                 let mut stats_by_hero: HashMap<i64, PlayerStats> = HashMap::new();
                 if ctrl_keys_resolved {
                     for (_, entity) in ctx.entities().iter() {
@@ -1627,21 +1815,6 @@ impl DemoParser {
                         if hero_id == 0 {
                             continue;
                         }
-
-                        let stat_modifier_values_available = ck_stat_count.is_some()
-                            && ck_stat_keys
-                                .iter()
-                                .any(|(kind, value)| kind.is_some() && value.is_some());
-                        let stat_count = get_i64(entity, ck_stat_count)
-                            .clamp(0, ck_stat_keys.len() as i64)
-                            as usize;
-                        let stat_modifiers = boon::aggregate_stat_modifier_values(
-                            ck_stat_keys.iter().take(stat_count).map(
-                                |(value_type_key, value_key)| {
-                                    (entity.get_u32(*value_type_key), entity.get_f32(*value_key))
-                                },
-                            ),
-                        );
 
                         let mut slots = Vec::with_capacity(SIGNATURE_ABILITY_SLOTS);
                         for (slot_idx, (item_key, bits_key)) in ck_ability_keys.iter().enumerate() {
@@ -1656,7 +1829,7 @@ impl DemoParser {
                             }
                             slots.push(AbilitySlot {
                                 ability_id,
-                                ability_name: boon::ability_name(ability_id).to_string(),
+                                ability_name: names.ability_name(ability_id).to_string(),
                             });
                             let previous = ability_prev_level
                                 .get(&(hero_id, slot_idx))
@@ -1683,32 +1856,17 @@ impl DemoParser {
                         stats_by_hero.insert(
                             hero_id,
                             PlayerStats {
+                                pawn_handle: entity
+                                    .get_handle(ck_hero_pawn)
+                                    .or_else(|| entity.get_handle(ck_pawn)),
                                 net_worth: get_i64(entity, ck_net_worth) as i32,
                                 ap_net_worth: get_i64(entity, ck_ap_net_worth) as i32,
                                 kills: get_i64(entity, ck_kills) as i32,
                                 deaths: get_i64(entity, ck_deaths) as i32,
                                 assists: get_i64(entity, ck_assists) as i32,
                                 hero_damage: get_i64(entity, ck_damage) as i32,
-                                hero_healing: get_i64(entity, ck_healing) as i32,
                                 objective_damage: get_i64(entity, ck_objective_damage) as i32,
                                 health_max: get_i64(entity, ck_health_max) as i32,
-                                stat_modifier_health: stat_modifiers
-                                    [boon::StatModifierKind::Health],
-                                stat_modifier_spirit_power: stat_modifiers
-                                    [boon::StatModifierKind::SpiritPower],
-                                stat_modifier_fire_rate: stat_modifiers
-                                    [boon::StatModifierKind::FireRate],
-                                stat_modifier_weapon_damage: stat_modifiers
-                                    [boon::StatModifierKind::WeaponDamage],
-                                stat_modifier_cooldown_reduction: stat_modifiers
-                                    [boon::StatModifierKind::CooldownReduction],
-                                stat_modifier_ammo: stat_modifiers[boon::StatModifierKind::Ammo],
-                                stat_modifier_bullet_resist: stat_modifiers
-                                    [boon::StatModifierKind::BulletResist],
-                                stat_modifier_spirit_resist: stat_modifiers
-                                    [boon::StatModifierKind::SpiritResist],
-                                stat_modifier_values_available,
-                                unknown_stat_modifier_count: stat_modifiers.unknown_count as i32,
                             },
                         );
                     }
@@ -1739,6 +1897,11 @@ impl DemoParser {
                     let cz = get_i64(entity, pk_cell_z) as i32;
 
                     let stats = stats_by_hero.get(&hero_id).copied().unwrap_or_default();
+                    let barrier = stats
+                        .pawn_handle
+                        .filter(|&handle| pawn_index(ctx.entities(), Some(handle)) == Some(idx))
+                        .map(|handle| barriers.at(ctx.tick(), handle))
+                        .unwrap_or_default();
 
                     // Look direction: QAngle is [pitch, yaw, roll] in degrees.
                     let [pitch, yaw, _] = entity.get_qangle(pk_eye);
@@ -1754,6 +1917,8 @@ impl DemoParser {
                         yaw,
                         pitch,
                         health: get_i64(entity, pk_health) as i32,
+                        barrier: barrier.remaining,
+                        max_barrier: barrier.capacity,
                         // Prefer the controller's effective max; fall back to
                         // the pawn's base max for heroes without a controller
                         // entity yet (m_iHealthMax not populated).
@@ -1762,25 +1927,13 @@ impl DemoParser {
                         } else {
                             get_i64(entity, pk_max_health) as i32
                         },
-                        barrier: barrier_by_pawn.get(&idx).copied().unwrap_or(0.0),
                         net_worth: stats.net_worth,
                         ap_net_worth: stats.ap_net_worth,
                         kills: stats.kills,
                         deaths: stats.deaths,
                         assists: stats.assists,
                         hero_damage: stats.hero_damage,
-                        hero_healing: stats.hero_healing,
                         objective_damage: stats.objective_damage,
-                        stat_modifier_health: stats.stat_modifier_health,
-                        stat_modifier_spirit_power: stats.stat_modifier_spirit_power,
-                        stat_modifier_fire_rate: stats.stat_modifier_fire_rate,
-                        stat_modifier_weapon_damage: stats.stat_modifier_weapon_damage,
-                        stat_modifier_cooldown_reduction: stats.stat_modifier_cooldown_reduction,
-                        stat_modifier_ammo: stats.stat_modifier_ammo,
-                        stat_modifier_bullet_resist: stats.stat_modifier_bullet_resist,
-                        stat_modifier_spirit_resist: stats.stat_modifier_spirit_resist,
-                        stat_modifier_values_available: stats.stat_modifier_values_available,
-                        unknown_stat_modifier_count: stats.unknown_stat_modifier_count,
                     });
                 }
 
@@ -1797,12 +1950,13 @@ impl DemoParser {
                     tk_vec_y = s.resolve_field_key(&format!("{o}.m_vecY"));
                     tk_team = s.resolve_field_key("m_iTeamNum");
                     tk_life = s.resolve_field_key("m_lifeState");
+                    tk_max_health = s.resolve_field_key("m_iMaxHealth");
                     trooper_keys_resolved = true;
                 }
                 let mut troopers: Vec<i32> = Vec::new();
                 if trooper_keys_resolved {
                     for (_, e) in ctx.entities().iter() {
-                        if e.class_name.as_ref() != TROOPER_CLASS || get_i64(e, tk_life) != 0 {
+                        if !is_live_npc(e, TROOPER_CLASS, tk_life, tk_max_health) {
                             continue;
                         }
                         let x =
@@ -1819,7 +1973,7 @@ impl DemoParser {
                 // block above once the first urn appears.
                 let mut urns: Vec<f32> = Vec::new();
                 for (_, e) in ctx.entities().iter() {
-                    if e.class_name.as_ref() != IDOL_CLASS {
+                    if !e.active || e.class_name.as_ref() != IDOL_CLASS {
                         continue;
                     }
                     let x =
@@ -1831,19 +1985,24 @@ impl DemoParser {
                 }
                 // No world entity but someone's carrying it → plot it on the
                 // carrier so the urn stays visible through the carry.
-                if urns.is_empty()
-                    && let Some(cp) = carrier_pawn
-                    && let Some(e) = ctx.entities().get(cp)
-                    && e.class_name.as_ref() == PAWN_CLASS
-                {
-                    urns.push(boon::cell_to_world(
-                        get_i64(e, pk_cell_x) as i32,
-                        get_f32(e, pk_x),
-                    ));
-                    urns.push(boon::cell_to_world(
-                        get_i64(e, pk_cell_y) as i32,
-                        get_f32(e, pk_y),
-                    ));
+                if urns.is_empty() {
+                    for &handle in &carrier_pawns {
+                        let Some(e) = ctx
+                            .entities()
+                            .get_by_handle(handle)
+                            .filter(|e| e.active && e.class_name.as_ref() == PAWN_CLASS)
+                        else {
+                            continue;
+                        };
+                        urns.push(boon::cell_to_world(
+                            get_i64(e, pk_cell_x) as i32,
+                            get_f32(e, pk_x),
+                        ));
+                        urns.push(boon::cell_to_world(
+                            get_i64(e, pk_cell_y) as i32,
+                            get_f32(e, pk_y),
+                        ));
+                    }
                 }
 
                 last_emitted = Some(ctx.tick());
@@ -1886,7 +2045,7 @@ impl DemoParser {
                 tick,
                 id: id.index,
                 serial: id.serial,
-                subclass_name: boon::breakable_name(state.subclass_id).to_string(),
+                subclass_name: names.breakable_name(state.subclass_id).to_string(),
                 team: state.team,
                 x: state.x,
                 y: state.y,
@@ -1917,7 +2076,7 @@ impl DemoParser {
                 tick: raw.tick,
                 hero_id,
                 ability_id: raw.ability_id,
-                ability_name: boon::ability_name(raw.ability_id).to_string(),
+                ability_name: names.ability_name(raw.ability_id).to_string(),
                 change: kind.to_string(),
             });
         }
@@ -1997,7 +2156,7 @@ impl DemoParser {
 
         // Resolve objective killers (entity handle → pawn → hero). Non-player
         // killers (troopers, self-destructs) resolve to 0.
-        let objective_events: Vec<ObjectiveEvent> = objective_events_raw
+        let mut objective_events: Vec<ObjectiveEvent> = objective_events_raw
             .into_iter()
             .map(|raw| {
                 let killer_hero_id = if raw.killer_pawn > 0 {
@@ -2016,6 +2175,9 @@ impl DemoParser {
                 }
             })
             .collect();
+
+        objective_events.extend(urn_events);
+        objective_events.sort_by_key(|event| event.tick);
 
         // Objective roster, folding in death ticks; sorted by id for stability.
         let mut objectives: Vec<ObjectiveInfo> = obj_roster
@@ -2071,6 +2233,7 @@ impl DemoParser {
             sinner_events,
             chat_events,
             modifier_spans,
+            permanent_buffs: pickup_history.events,
             pause_intervals,
             game_over_tick,
             regulation_ticks,
@@ -2084,6 +2247,7 @@ impl DemoParser {
 
 #[derive(Serialize)]
 struct PositionsResult {
+    permanent_buffs: Vec<pickups::Event>,
     players: Vec<PlayerInfo>,
     winner: Option<i32>,
     /// `ECitadelGameMode`: 1 = regular 6v6, 4 = Street Brawl.
@@ -2269,24 +2433,26 @@ impl OpenModifier {
         entry: &boon_proto::proto::CModifierTableEntry,
         tick: i32,
         reg_tick: i32,
+        entities: &boon::EntityContainer,
         pawn_to_hero: &HashMap<i32, i64>,
+        names: &boon::CatalogNames,
     ) -> Option<Self> {
-        let parent = boon::protobuf_handle_index(entry.parent)?;
+        let parent = pawn_index(entities, entry.parent)?;
         let hero_id = pawn_to_hero.get(&parent).copied()?;
         let ability_id = entry.ability_subclass.unwrap_or(0);
         let modifier_id = entry.modifier_subclass.unwrap_or(0);
-        let ability_name = match boon::ability_name(ability_id) {
+        let ability_name = match names.ability_name(ability_id) {
             "ABILITY_NOT_FOUND" => String::new(),
             name => name.to_string(),
         };
-        let modifier_name = match boon::modifier_name(modifier_id) {
+        let modifier_name = match names.modifier_name(modifier_id) {
             "MODIFIER_NOT_FOUND" => String::new(),
             name => name.to_string(),
         };
         if ability_name.is_empty() && modifier_name.is_empty() {
             return None;
         }
-        let caster_hero_id = boon::protobuf_handle_index(entry.caster)
+        let caster_hero_id = pawn_index(entities, entry.caster)
             .and_then(|index| pawn_to_hero.get(&index).copied())
             .unwrap_or(0);
         Some(Self {
@@ -2383,7 +2549,7 @@ impl MapEntityKeys {
     }
 
     fn position(self, entity: &boon::Entity) -> [f32; 3] {
-        entity.world_position(self.cell, self.offset)
+        boon::world_position(entity, self.cell, self.offset)
     }
 }
 
@@ -2447,6 +2613,8 @@ struct ObjKeys {
     health: Option<u64>,
     max_health: Option<u64>,
     team: Option<u64>,
+    phase: Option<u64>,
+    life: Option<u64>,
 }
 
 fn resolve_obj_keys(s: &Serializer) -> ObjKeys {
@@ -2460,6 +2628,8 @@ fn resolve_obj_keys(s: &Serializer) -> ObjKeys {
         health: s.resolve_field_key("m_iHealth"),
         max_health: s.resolve_field_key("m_iMaxHealth"),
         team: s.resolve_field_key("m_iTeamNum"),
+        phase: s.resolve_field_key("m_ePhase"),
+        life: s.resolve_field_key("m_lifeState"),
     }
 }
 
@@ -2493,6 +2663,10 @@ struct ObjectiveHealthEvent {
     id: i32,
     health: i32,
     max_health: i32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    phase: Option<i32>,
+    x: f32,
+    y: f32,
 }
 
 /// Index of the nearest camp within CAMP_RADIUS of (x, y), or None.
@@ -2540,6 +2714,8 @@ struct CampStateEvent {
 #[derive(Serialize)]
 struct PlayerInfo {
     name: String,
+    /// Decimal text preserves the full 64-bit account ID across JS runtimes.
+    steam_id: String,
     hero_id: i64,
     hero_name: String,
     team: i32,
@@ -2547,8 +2723,8 @@ struct PlayerInfo {
     rank: i64,
 }
 
-const PLAYER_I32_STRIDE: usize = 16;
-const PLAYER_F32_STRIDE: usize = 14;
+const PLAYER_I32_STRIDE: usize = 13;
+const PLAYER_F32_STRIDE: usize = 7;
 
 /// Columnar sampled-frame storage. Numeric typed arrays are both much smaller
 /// than nested JavaScript objects and transferable from the worker without a
@@ -2567,7 +2743,8 @@ struct PackedFrames {
 
 impl PackedFrames {
     fn with_capacity(frame_capacity: usize) -> Self {
-        let player_capacity = frame_capacity.saturating_mul(10);
+        // Reserve for 6v6 so 12-player demos do not grow both player columns.
+        let player_capacity = frame_capacity.saturating_mul(12);
         let mut player_offsets = Vec::with_capacity(frame_capacity + 1);
         let mut trooper_offsets = Vec::with_capacity(frame_capacity + 1);
         let mut urn_offsets = Vec::with_capacity(frame_capacity + 1);
@@ -2611,10 +2788,7 @@ impl PackedFrames {
                 player.deaths,
                 player.assists,
                 player.hero_damage,
-                player.hero_healing,
                 player.objective_damage,
-                i32::from(player.stat_modifier_values_available),
-                player.unknown_stat_modifier_count,
             ]);
             self.player_f32.extend_from_slice(&[
                 player.x,
@@ -2622,15 +2796,8 @@ impl PackedFrames {
                 player.z,
                 player.yaw,
                 player.pitch,
-                player.stat_modifier_health,
-                player.stat_modifier_spirit_power,
-                player.stat_modifier_fire_rate,
-                player.stat_modifier_weapon_damage,
-                player.stat_modifier_cooldown_reduction,
-                player.stat_modifier_ammo,
                 player.barrier,
-                player.stat_modifier_bullet_resist,
-                player.stat_modifier_spirit_resist,
+                player.max_barrier,
             ]);
         }
         self.player_offsets
@@ -2699,24 +2866,14 @@ struct PlayerPosition {
     health: i32,
     max_health: i32,
     barrier: f32,
+    max_barrier: f32,
     net_worth: i32,
     ap_net_worth: i32,
     kills: i32,
     deaths: i32,
     assists: i32,
     hero_damage: i32,
-    hero_healing: i32,
     objective_damage: i32,
-    stat_modifier_health: f32,
-    stat_modifier_spirit_power: f32,
-    stat_modifier_fire_rate: f32,
-    stat_modifier_weapon_damage: f32,
-    stat_modifier_cooldown_reduction: f32,
-    stat_modifier_ammo: f32,
-    stat_modifier_bullet_resist: f32,
-    stat_modifier_spirit_resist: f32,
-    stat_modifier_values_available: bool,
-    unknown_stat_modifier_count: i32,
 }
 
 /// One of a hero's signature abilities (constant for the match), emitted once
@@ -2760,25 +2917,15 @@ struct AbilityUpgradeEvent {
 
 #[derive(Default, Clone, Copy)]
 struct PlayerStats {
+    pawn_handle: Option<u32>,
     net_worth: i32,
     ap_net_worth: i32,
     kills: i32,
     deaths: i32,
     assists: i32,
     hero_damage: i32,
-    hero_healing: i32,
     objective_damage: i32,
     health_max: i32,
-    stat_modifier_health: f32,
-    stat_modifier_spirit_power: f32,
-    stat_modifier_fire_rate: f32,
-    stat_modifier_weapon_damage: f32,
-    stat_modifier_cooldown_reduction: f32,
-    stat_modifier_ammo: f32,
-    stat_modifier_bullet_resist: f32,
-    stat_modifier_spirit_resist: f32,
-    stat_modifier_values_available: bool,
-    unknown_stat_modifier_count: i32,
 }
 
 fn get_i64(e: &boon::Entity, key: Option<u64>) -> i64 {
@@ -2802,16 +2949,6 @@ fn get_f32(e: &boon::Entity, key: Option<u64>) -> f32 {
         .unwrap_or(0.0)
 }
 
-fn current_simulation_time(ctx: &boon::Context, key: Option<u64>) -> Option<f32> {
-    let key = key?;
-    ctx.entities()
-        .iter()
-        .filter(|(_, entity)| entity.class_name.as_ref() == PAWN_CLASS)
-        .map(|(_, entity)| entity.get_f32(Some(key)))
-        .filter(|value| value.is_finite() && *value > 0.0)
-        .max_by(f32::total_cmp)
-}
-
 fn get_string(e: &boon::Entity, key: Option<u64>) -> String {
     key.and_then(|k| e.fields.get(&k))
         .and_then(|v| match v {
@@ -2821,13 +2958,83 @@ fn get_string(e: &boon::Entity, key: Option<u64>) -> String {
         .unwrap_or_default()
 }
 
-fn to_js_error(e: boon::Error) -> JsError {
+fn to_js_error(e: impl std::fmt::Display) -> JsError {
     JsError::new(&e.to_string())
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{AbilitySlot, should_replace_ability_slots};
+    use super::{
+        AbilitySlot, MapEntityKeys, OpenModifier, PAWN_CLASS, TROOPER_CLASS, is_live_npc,
+        pawn_index, should_replace_ability_slots,
+    };
+
+    #[test]
+    fn patron_phase_one_kill_is_not_final_destruction() {
+        for phase in [0, 2] {
+            assert_eq!(
+                super::objective_kill_action("patron", Some(phase)),
+                "phase_one_destroyed"
+            );
+        }
+        assert_eq!(super::objective_kill_action("patron", Some(1)), "destroyed");
+        assert_eq!(super::objective_kill_action("patron", None), "destroyed");
+        assert_eq!(super::objective_kill_action("walker", Some(0)), "destroyed");
+        assert_eq!(super::objective_kill_action("mid_boss", None), "killed");
+    }
+
+    #[test]
+    fn reserves_full_6v6_frame_columns_without_growth() {
+        let mut frames = super::PackedFrames::with_capacity(3);
+        let capacity = (frames.player_i32.capacity(), frames.player_f32.capacity());
+        for _ in 0..3 * 12 {
+            frames
+                .player_i32
+                .extend_from_slice(&[0; super::PLAYER_I32_STRIDE]);
+            frames
+                .player_f32
+                .extend_from_slice(&[0.0; super::PLAYER_F32_STRIDE]);
+        }
+        assert_eq!(
+            (frames.player_i32.capacity(), frames.player_f32.capacity()),
+            capacity
+        );
+    }
+
+    #[test]
+    fn modifier_owners_reject_reused_slots_and_non_pawns() {
+        let mut entities = boon::EntityContainer::new();
+        for (index, serial, class) in [(2, 7, PAWN_CLASS), (3, 9, PAWN_CLASS), (4, 1, "Ability")] {
+            entities
+                .insert(
+                    boon::Entity::from_fields(index, serial, 1, class, true, Default::default())
+                        .unwrap(),
+                )
+                .unwrap();
+        }
+        assert_eq!(pawn_index(&entities, Some((7 << 14) | 2)), Some(2));
+        assert_eq!(pawn_index(&entities, Some((6 << 14) | 2)), None);
+        assert_eq!(pawn_index(&entities, Some((1 << 14) | 4)), None);
+        assert_eq!(pawn_index(&entities, None), None);
+        let heroes = std::collections::HashMap::from([(2, 63), (3, 15)]);
+        let mut names = boon::CatalogNames::default();
+        names
+            .abilities
+            .insert(123, "citadel_ability_hook".to_string());
+        let mut entry = boon_proto::proto::CModifierTableEntry {
+            parent: Some((7 << 14) | 2),
+            caster: Some((9 << 14) | 3),
+            ability_subclass: Some(123),
+            ..Default::default()
+        };
+        let span =
+            |entry: &_| OpenModifier::from_entry(1, entry, 10, 10, &entities, &heroes, &names);
+        assert_eq!(span(&entry).unwrap().caster_hero_id, 15);
+        entry.caster = Some((8 << 14) | 3);
+        assert_eq!(span(&entry).unwrap().caster_hero_id, 0);
+        entry.parent = Some((6 << 14) | 2);
+        assert!(span(&entry).is_none());
+    }
 
     fn slots(ids: &[u32]) -> Vec<AbilitySlot> {
         ids.iter()
@@ -2844,5 +3051,52 @@ mod tests {
         let geist = slots(&[5, 6, 7, 8]);
         assert!(should_replace_ability_slots(Some(&werewolf), &geist));
         assert!(!should_replace_ability_slots(Some(&geist), &geist));
+    }
+
+    #[test]
+    fn map_entities_use_deadlock_coordinate_origin() {
+        let keys = MapEntityKeys {
+            cell: [Some(1), Some(2), Some(3)],
+            offset: [Some(4), Some(5), Some(6)],
+            team: None,
+            health: None,
+            max_health: None,
+            subclass_id: None,
+        };
+        let mut entity =
+            boon::Entity::from_fields(1, 1, 1, "CCitadel_BreakableProp", true, Default::default())
+                .expect("valid test entity");
+        for (key, cell, offset) in [(1, 64, 0.0), (2, 63, 128.0), (3, 65, 32.0)] {
+            entity.fields.insert(key, boon::FieldValue::U32(cell));
+            entity.fields.insert(key + 3, boon::FieldValue::F32(offset));
+        }
+        assert_eq!(boon::cell_to_world(64, 0.0), 0.0);
+        assert_eq!(keys.position(&entity), [0.0, -384.0, 544.0]);
+    }
+
+    #[test]
+    fn live_npc_requires_active_alive_entity_with_health() {
+        const LIFE_KEY: u64 = 1;
+        const MAX_HEALTH_KEY: u64 = 2;
+
+        let npc = |active, class_name: &str, life, max_health| {
+            let mut entity =
+                boon::Entity::from_fields(1, 1, 1, class_name, active, Default::default())
+                    .expect("valid test entity");
+            entity.fields.insert(LIFE_KEY, boon::FieldValue::I64(life));
+            entity
+                .fields
+                .insert(MAX_HEALTH_KEY, boon::FieldValue::I64(max_health));
+            entity
+        };
+        let is_live = |entity: &boon::Entity| {
+            is_live_npc(entity, TROOPER_CLASS, Some(LIFE_KEY), Some(MAX_HEALTH_KEY))
+        };
+
+        assert!(is_live(&npc(true, TROOPER_CLASS, 0, 100)));
+        assert!(!is_live(&npc(false, TROOPER_CLASS, 0, 100)));
+        assert!(!is_live(&npc(true, TROOPER_CLASS, 2, 100)));
+        assert!(!is_live(&npc(true, TROOPER_CLASS, 0, 0)));
+        assert!(!is_live(&npc(true, "CNPC_TrooperNeutral", 0, 100)));
     }
 }

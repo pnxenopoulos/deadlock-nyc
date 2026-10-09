@@ -1,12 +1,7 @@
 import * as React from "react";
-import {
-  ChevronDown,
-  ChevronLeft,
-  Shield,
-  ShieldHalf,
-} from "lucide-react";
+import { ChevronDown, ChevronLeft, Loader2, Shield } from "lucide-react";
 
-import { AbilityIcon, prettifyAbilityName } from "@/components/ability-icon";
+import { AbilityIcon, abilityNameFromId, prettifyAbilityName } from "@/components/ability-icon";
 import { ItemIcon, itemDisplayName } from "@/components/item-icon";
 import { RankBadge } from "@/components/rank-badge";
 import type {
@@ -28,10 +23,31 @@ import {
 } from "@/components/ui/tooltip";
 import {
   collapseModifierRows,
+  isIgnoredModifier,
+  isPermanentStatPickup,
+  statDiagnostic,
   type ModifierRow,
 } from "@/lib/modifier-rows";
+import {
+  contributionLabel,
+  contributionSource,
+  contributionValue,
+  visibleContributions,
+  RESISTANCE_EXPLANATION,
+  statSourceLabel,
+} from "@/lib/stat-breakdown";
 import { cn } from "@/lib/utils";
+import type {
+  AbilityContribution,
+  AbilityStatRow,
+  HeroStatRow,
+  PlayerDetails,
+  PlayerStatus,
+  StatContribution,
+} from "@/wasm/player-details";
 import itemStats from "@/data/item-stats.json";
+import { PICKUP_STATS, type PickupTotals } from "@/wasm/pickups";
+import type { CatalogInfo } from "@/wasm/catalog";
 
 type ItemCategory = "weapon" | "vitality" | "spirit";
 
@@ -50,120 +66,64 @@ const CATEGORY_COLORS: Record<ItemCategory, string> = {
   spirit: "#c27ce0",
 };
 
+type HeroStatMeta = {
+  label: string;
+  icon: string;
+  group: ItemCategory;
+};
+
+const HERO_STAT_META: Record<string, HeroStatMeta> = {
+  clip_size: { label: "Clip size", icon: "ammo_clip_size", group: "weapon" },
+  bullet_velocity: { label: "Bullet velocity", icon: "bullet_velocity", group: "weapon" },
+  melee_distance: { label: "Melee distance", icon: "range_close", group: "weapon" },
+  reload_time: { label: "Reload time", icon: "ammo_reload", group: "weapon" },
+  fire_rate: { label: "Fire rate", icon: "fire_rate", group: "weapon" },
+  falloff_start: { label: "Falloff start", icon: "range", group: "weapon" },
+  falloff_end: { label: "Falloff end", icon: "range_long", group: "weapon" },
+  light_melee_damage: { label: "Light melee", icon: "melee_light", group: "weapon" },
+  heavy_melee_damage: { label: "Heavy melee", icon: "damage_melee", group: "weapon" },
+  weapon_damage: { label: "Weapon damage", icon: "damage_weapon", group: "weapon" },
+  move_speed: { label: "Move speed", icon: "move_speed", group: "vitality" },
+  sprint_speed: { label: "Sprint speed", icon: "move_sprint", group: "vitality" },
+  slide_distance: { label: "Slide distance", icon: "move_slide", group: "vitality" },
+  stamina: { label: "Stamina", icon: "move_stamina", group: "vitality" },
+  stamina_cooldown: { label: "Stamina cooldown", icon: "move_stamina_recharge", group: "vitality" },
+  dash_speed: { label: "Dash speed", icon: "move_dash", group: "vitality" },
+  dash_duration: { label: "Dash duration", icon: "duration", group: "vitality" },
+  air_dash_speed: { label: "Air dash speed", icon: "move_double_jump", group: "vitality" },
+  air_dash_duration: { label: "Air dash duration", icon: "duration", group: "vitality" },
+  gravity_scale: { label: "Gravity scale", icon: "move_double_jump", group: "vitality" },
+  bullet_evasion: { label: "Bullet evasion", icon: "move_dodge", group: "vitality" },
+  debuff_resist: { label: "Debuff resist", icon: "debuff_remove", group: "vitality" },
+  bullet_resist: { label: "Bullet resist", icon: "resist_bullet", group: "vitality" },
+  melee_resist: { label: "Melee resist", icon: "resist_melee", group: "vitality" },
+  bullet_lifesteal: { label: "Bullet lifesteal", icon: "health_stealing_bullets", group: "vitality" },
+  melee_lifesteal: { label: "Melee lifesteal", icon: "health_stealing_melee", group: "vitality" },
+  spirit_resist: { label: "Spirit resist", icon: "resist_spirit", group: "spirit" },
+  spirit_lifesteal: { label: "Spirit lifesteal", icon: "health_stealing_spirit", group: "spirit" },
+};
+
+const ABILITY_STAT_META: Record<string, { label: string; icon: string }> = {
+  cooldown_reduction: { label: "Cooldown", icon: "cooldown" },
+  item_cooldown_reduction: { label: "Item cooldown", icon: "recharge" },
+  duration_bonus: { label: "Duration", icon: "duration" },
+  range_bonus: { label: "Range", icon: "range" },
+  radius_bonus: { label: "Radius", icon: "range_aoe" },
+};
+
+function propertyIcon(name: string): string {
+  return `/icons/properties/${name}.svg`;
+}
+
 // Souls as "X.Yk" (e.g. 6400 -> "6.4k"); 0 stays "0".
 function formatSouls(value: number): string {
   if (value <= 0) return "0";
   return `${(value / 1000).toFixed(1)}k`;
 }
 
-type IconProps = { className?: string };
-
-function HealthIcon({ className }: IconProps) {
-  return (
-    <svg
-      viewBox="0 0 128 128"
-      fill="currentColor"
-      xmlns="http://www.w3.org/2000/svg"
-      aria-hidden
-      className={className}
-    >
-      <path d="M57.7814 20.0248C55.2511 16.6262 51.9662 13.8614 48.1855 11.9483C44.4048 10.0351 40.2316 9.02587 35.9945 9C20.5247 9 8 22.2802 8 38.6586C8 68.2954 42.4102 87.6846 61.3834 116.752C62.8833 119.062 65.1167 119.062 66.6166 116.752C85.5898 87.6846 120 68.2954 120 38.6586C120 22.2364 107.475 9 92.0055 9C87.7684 9.02587 83.5952 10.0351 79.8145 11.9483C76.0338 13.8614 72.7489 16.6262 70.2186 20.0248C63.5183 28.7943 64.4817 28.7943 57.7814 20.0248Z" />
-    </svg>
-  );
-}
-
-function WeaponDamageIcon({ className }: IconProps) {
-  return (
-    <svg
-      viewBox="0 0 128 128"
-      fill="currentColor"
-      xmlns="http://www.w3.org/2000/svg"
-      aria-hidden
-      className={className}
-    >
-      <path d="M27.4815 24.52C27.4015 24.52 27.3215 24.52 27.2415 24.52C16.1015 24.52 6.96146 33.09 6.06146 44C5.98146 44.97 6.62146 45.77 7.39146 45.77H8.80146C10.3515 45.77 11.2015 48.91 10.6915 52.79L4.03146 103.36C3.77146 105.3 5.15146 106.87 7.11146 106.87H39.8715C41.8315 106.87 43.6215 105.3 43.8715 103.36L45.1615 93.53C45.6715 89.65 49.2615 86.51 53.1715 86.51H62.0015C73.7415 86.51 83.2515 76.99 83.2515 65.26L85.0215 59.06C86.0015 55.64 90.7615 52.86 95.6515 52.86H115.131C117.091 52.86 118.671 51.27 118.671 49.32V42.24H121.331C122.801 42.24 123.991 40.65 123.991 38.7V31.62C123.991 29.66 122.801 28.08 121.331 28.08H118.671V26.31C118.671 25.33 117.481 24.54 116.011 24.54H113.351L110.691 21H100.061L97.4015 24.54H34.5615C34.5615 24.54 32.7915 21 31.0215 21C29.2515 21 27.4815 24.54 27.4815 24.54V24.52ZM62.0115 77.65C55.1615 77.65 49.6115 72.1 49.6115 65.25C49.6115 58.4 55.1615 52.85 62.0115 52.85C68.8615 52.85 74.4115 58.4 74.4115 65.25C74.4115 72.1 68.8615 77.65 62.0115 77.65Z" />
-    </svg>
-  );
-}
-
-function SpiritIcon({ className }: IconProps) {
-  return (
-    <svg
-      viewBox="0 0 128 128"
-      fill="currentColor"
-      xmlns="http://www.w3.org/2000/svg"
-      aria-hidden
-      className={className}
-    >
-      <path
-        fillRule="evenodd"
-        clipRule="evenodd"
-        d="M66.2532 6.37122C65.2804 4.54292 62.7195 4.54293 61.7471 6.37122L44.1015 39.5393C43.7322 40.233 43.0786 40.7202 42.3208 40.8656L6.09636 47.8197C4.0996 48.2031 3.30824 50.6996 4.70387 52.2131L30.0227 79.6659C30.5523 80.2401 30.8021 81.0281 30.7029 81.8119L25.9605 119.278C25.6991 121.343 27.7709 122.886 29.6061 121.993L62.8996 105.792C63.5958 105.453 64.4041 105.453 65.1007 105.792L98.3941 121.993C100.229 122.886 102.301 121.343 102.039 119.278L97.2971 81.8119C97.198 81.0281 97.4478 80.2401 97.9775 79.6659L123.296 52.2131C124.692 50.6996 123.9 48.2031 121.904 47.8197L85.6794 40.8656C84.9216 40.7202 84.2676 40.233 83.8987 39.5393L66.2532 6.37122ZM61.591 25.1546C62.4149 22.8569 65.585 22.8569 66.4088 25.1546L74.0468 46.4571C74.0262 46.6577 74.0427 46.8669 74.1027 47.0765L80.7174 70.2705C81.0437 71.4137 82.4267 71.8103 83.2841 71.0064L89.8403 64.8601C90.2444 64.4812 90.4268 63.9135 90.3212 63.3625L88.2169 52.3689H105.054C107.473 52.3689 108.549 55.4865 106.667 57.0454L88.2542 72.3055C88.002 72.3447 87.7539 72.4484 87.5329 72.6233L68.8712 87.3875C67.9513 88.1151 68.0948 89.5801 69.1376 90.1057L77.1093 94.1261C77.6011 94.3739 78.1829 94.3413 78.6453 94.0398L87.1338 88.5041L91.7117 104.982C92.3741 107.366 89.7479 109.28 87.7692 107.856L65.4784 91.817C65.1775 91.6009 64.8427 91.4579 64.4968 91.3885L49.094 80.6881C48.1185 80.0104 46.79 80.6347 46.6536 81.8342L45.6334 90.8129C45.5701 91.3705 45.7949 91.9218 46.2268 92.2674L53.6701 98.2257L40.3621 107.852C38.3884 109.28 35.7592 107.376 36.4112 104.992L43.1392 80.3897C43.1792 80.3161 43.2113 80.236 43.2337 80.1503L49.1451 57.6041C49.3367 56.8737 48.7365 56.1808 48.0061 56.2894L38.1921 57.7505C37.809 57.8078 37.4899 58.0808 37.3666 58.4569L34.247 67.9728L21.4828 57.6794C19.5888 56.152 20.607 53.0327 23.0163 52.9813L48.6012 52.4376C48.6776 52.4473 48.7558 52.4511 48.835 52.4491L69.3532 51.9036C70.4695 51.8738 71.1996 50.6927 70.7491 49.6451L67.0293 40.995C66.7781 40.411 66.2149 40.0346 65.5925 40.0346H56.256L61.591 25.1546Z"
-      />
-    </svg>
-  );
-}
-
-function FireRateIcon({ className }: IconProps) {
-  return (
-    <svg
-      viewBox="0 0 128 128"
-      fill="currentColor"
-      xmlns="http://www.w3.org/2000/svg"
-      aria-hidden
-      className={className}
-    >
-      <path d="M78.6699 83C98.9999 83 103 91 103 91C103 91 98.9999 99 78.6699 99H51V83H78.6699ZM45.4199 88.5C46.5245 88.5 47.4199 89.3954 47.4199 90.5C47.4199 91.6046 46.5245 92.5 45.4199 92.5H13.4199C12.3154 92.5 11.4199 91.6046 11.4199 90.5C11.4199 89.3954 12.3154 88.5 13.4199 88.5H45.4199ZM98.6699 56C119 56 123 64 123 64C123 64 119 72 98.6699 72H71V56H98.6699ZM65 61.5C66.1046 61.5 67 62.3954 67 63.5C67 64.6046 66.1046 65.5 65 65.5H13C11.8954 65.5 11 64.6046 11 63.5C11 62.3954 11.8954 61.5 13 61.5H65ZM78.6699 29C98.9999 29 103 37 103 37C103 37 98.9999 45 78.6699 45H51V29H78.6699ZM45 35C46.1046 35 47 35.8954 47 37C47 38.1046 46.1046 39 45 39H13C11.8954 39 11 38.1046 11 37C11 35.8954 11.8954 35 13 35H45Z" />
-    </svg>
-  );
-}
-
-function CooldownIcon({ className }: IconProps) {
-  return (
-    <svg
-      viewBox="0 0 128 128"
-      fill="currentColor"
-      xmlns="http://www.w3.org/2000/svg"
-      aria-hidden
-      className={className}
-    >
-      <path
-        fillRule="evenodd"
-        clipRule="evenodd"
-        d="M118.149 64C118.149 34.1257 93.8743 9.85143 64 9.85143C34.1257 9.85143 9.85143 34.1257 9.85143 64C9.85143 93.8743 34.1257 118.149 64 118.149C83.4514 118.149 100.594 107.84 110.126 92.2743C111.543 89.9657 114.583 89.2343 116.891 90.6514C119.2 92.0686 119.931 95.1086 118.514 97.4171C107.269 115.771 86.9943 128 64 128C28.6857 128 0 99.3143 0 64C0 28.6857 28.6857 0 64 0C99.3143 0 128 28.6857 128 64C128 66.72 125.806 68.9143 123.086 68.9143C120.366 68.9143 118.171 66.72 118.171 64H118.149Z"
-      />
-      <path d="M98.5596 92.8915L121.965 75.1772L125.691 104.389L98.5596 92.8915Z" />
-      <path
-        fillRule="evenodd"
-        clipRule="evenodd"
-        d="M64.5484 97.3712C83.8855 97.3712 99.5655 81.6912 99.5655 62.3541C99.5655 43.0169 83.8855 27.3369 64.5484 27.3369C45.2112 27.3369 29.5312 43.0169 29.5312 62.3541C29.5312 81.6912 45.2112 97.3712 64.5484 97.3712ZM69.4627 40.4798C69.4627 37.7598 67.2684 35.5655 64.5484 35.5655C61.8284 35.5655 59.6341 37.7598 59.6341 40.4798V62.3541C59.6341 65.0741 61.8284 67.2683 64.5484 67.2683H86.4227C89.1427 67.2683 91.337 65.0741 91.337 62.3541C91.337 59.6341 89.1427 57.4398 86.4227 57.4398H69.4627V40.4798Z"
-      />
-    </svg>
-  );
-}
-
-function AmmoIcon({ className }: IconProps) {
-  return (
-    <svg
-      viewBox="0 0 128 128"
-      fill="currentColor"
-      xmlns="http://www.w3.org/2000/svg"
-      aria-hidden
-      className={className}
-    >
-      <path d="M16 0C16 0 0 8 0 48.64V104H32V48.64C32 8 16 0 16 0Z" />
-      <path d="M32 112H0V128H32V112Z" />
-      <path d="M64 0C64 0 48 8 48 48.64V104H80V48.64C80 8 64 0 64 0Z" />
-      <path d="M80 112H48V128H80V112Z" />
-      <path d="M112 0C112 0 96 8 96 48.64V104H128V48.64C128 8 112 0 112 0Z" />
-      <path d="M128 112H96V128H128V112Z" />
-    </svg>
-  );
-}
-
 const ITEM_PIXELS = 48;
 const SLOT_COUNT = 10;
-const ABILITY_PIXELS = 36;
+const ABILITY_PIXELS = 48;
 // Abilities have three upgrade tiers; we render one segment per tier.
 const ABILITY_TIERS = 3;
 const TICKS_PER_SECOND = 64;
@@ -249,6 +209,12 @@ export function PlayerDetail({
   abilityLevels,
   abilityCooldowns,
   modifiers,
+  details,
+  status,
+  permanentBuffs,
+  catalog,
+  detailsLoading,
+  detailsError,
   players,
   tick,
   regTick,
@@ -262,6 +228,12 @@ export function PlayerDetail({
   /** Reconstructed cooldown + charge timeline per ability_id (active player). */
   abilityCooldowns?: Map<number, AbilityCooldown>;
   modifiers?: ModifierSpan[];
+  details?: PlayerDetails;
+  status?: PlayerStatus;
+  permanentBuffs?: PickupTotals;
+  catalog?: CatalogInfo;
+  detailsLoading?: boolean;
+  detailsError?: string;
   players?: PlayerInfo[];
   tick?: number;
   /** Current non-paused match tick, used by modifier countdowns. */
@@ -271,9 +243,19 @@ export function PlayerDetail({
   const portrait = heroPortraitUrl(player.hero_id);
   const teamLabel = TEAM_NAMES[player.team] ?? `Team ${player.team}`;
   const teamColor = TEAM_COLORS[player.team] ?? "#888";
-  const statModifiersAvailable = stats?.stat_modifier_values_available ?? false;
-  const unknownStatModifiers = stats?.unknown_stat_modifier_count ?? 0;
-  const statModifiersComplete = unknownStatModifiers === 0;
+  const visibleModifiers = React.useMemo(
+    () => modifiers?.filter((modifier) => !isPermanentStatPickup(modifier) && !isIgnoredModifier(modifier.modifier_name)),
+    [modifiers],
+  );
+  const imbuesByAbility = React.useMemo(() => {
+    const byAbility = new Map<number, PlayerDetails["imbues"]["bindings"]>();
+    for (const binding of details?.imbues.bindings ?? []) {
+      const list = byAbility.get(binding.ability_id) ?? [];
+      list.push(binding);
+      byAbility.set(binding.ability_id, list);
+    }
+    return byAbility;
+  }, [details]);
 
   // Pad to a fixed 10-slot inventory so empty slots stay visible.
   const slots = (items?.items ?? []).slice(0, SLOT_COUNT);
@@ -353,7 +335,7 @@ export function PlayerDetail({
           />
           <BarrierBar
             barrier={stats?.barrier ?? 0}
-            maxHealth={stats?.max_health ?? 0}
+            maxBarrier={stats?.max_barrier ?? 0}
           />
         </CollapsibleSection>
 
@@ -370,6 +352,7 @@ export function PlayerDetail({
                 // including charge abilities (the between-cast lockout), where
                 // it sits alongside the charge pills.
                 const cd = activeCooldown(ac?.cooldowns, tick ?? 0);
+                const imbues = imbuesByAbility.get(a.ability_id) ?? [];
                 return (
                   <div
                     key={a.ability_id}
@@ -436,12 +419,28 @@ export function PlayerDetail({
                         {prettifyAbilityName(a.ability_name)}
                         {cd && ` · ${cd.remaining.toFixed(1)}s`}
                         {charge && ` · ${charge.count}/${ac!.maxCharges} charges`}
+                        {imbues.map((binding) => (
+                          <span key={binding.item_id} className="block text-purple-300">
+                            Imbued by {itemDisplayName(abilityNameFromId(binding.item_id) ?? binding.item_name ?? "") || `item ${binding.item_id}`}
+                          </span>
+                        ))}
                       </TooltipContent>
                     </Tooltip>
                     <LevelBars
                       level={abilityLevels?.get(a.ability_id) ?? 0}
                       color={teamColor}
                     />
+                    <div className="flex min-h-6 flex-wrap items-center justify-center gap-1" aria-label={imbues.length ? `Items imbuing ${prettifyAbilityName(a.ability_name)}` : undefined}>
+                      {imbues.map((binding) => (
+                        <ItemIcon
+                          key={binding.item_id}
+                          abilityId={binding.item_id}
+                          abilityName={abilityNameFromId(binding.item_id) ?? binding.item_name ?? ""}
+                          size={24}
+                          className="border border-purple-300/70"
+                        />
+                      ))}
+                    </div>
                   </div>
                 );
               })}
@@ -449,17 +448,17 @@ export function PlayerDetail({
           </CollapsibleSection>
         )}
 
-        {modifiers && (
+        {visibleModifiers && (
           <CollapsibleSection
             title="Modifiers"
             right={
               <span className="text-xs font-medium tabular-nums text-muted-foreground">
-                {modifiers.length || ""}
+                {visibleModifiers.length || ""}
               </span>
             }
           >
             <ModifierList
-              modifiers={modifiers}
+              modifiers={visibleModifiers}
               selfTeam={player.team}
               selfHeroId={player.hero_id}
               players={players}
@@ -493,7 +492,7 @@ export function PlayerDetail({
             </span>
           }
         >
-          <div className="grid grid-cols-5 gap-2">
+          <div className="grid grid-cols-5 place-items-center gap-2">
             {slots.map((it, i) =>
               it.ability_id ? (
                 (() => {
@@ -523,81 +522,33 @@ export function PlayerDetail({
           </div>
         </CollapsibleSection>
 
-        <CollapsibleSection title="Recorded bonuses">
-          <p className="mb-2 text-[10px] leading-relaxed text-muted-foreground">
-            Persistent modifier contributions recorded in the replay. These do
-            not include base hero stats or every dynamic ability effect.
-            {unknownStatModifiers > 0 && (
-              <>
-                {" "}~ marks totals that may omit {unknownStatModifiers}{" "}
-                unrecognized modifier{unknownStatModifiers === 1 ? "" : "s"}.
-              </>
-            )}
-          </p>
-          <dl className="grid grid-cols-3 gap-x-3 gap-y-2">
-            <Bonus
-              icon={HealthIcon}
-              label="Health"
-              value={stats?.stat_modifier_health ?? 0}
-              available={statModifiersAvailable}
-              complete={statModifiersComplete}
-            />
-            <Bonus
-              icon={WeaponDamageIcon}
-              label="Weapon DMG"
-              value={stats?.stat_modifier_weapon_damage ?? 0}
-              available={statModifiersAvailable}
-              complete={statModifiersComplete}
-              percent
-            />
-            <Bonus
-              icon={SpiritIcon}
-              label="Spirit"
-              value={stats?.stat_modifier_spirit_power ?? 0}
-              available={statModifiersAvailable}
-              complete={statModifiersComplete}
-            />
-            <Bonus
-              icon={FireRateIcon}
-              label="Fire Rate"
-              value={stats?.stat_modifier_fire_rate ?? 0}
-              available={statModifiersAvailable}
-              complete={statModifiersComplete}
-              percent
-            />
-            <Bonus
-              icon={CooldownIcon}
-              label="CDR"
-              value={stats?.stat_modifier_cooldown_reduction ?? 0}
-              available={statModifiersAvailable}
-              complete={statModifiersComplete}
-              percent
-            />
-            <Bonus
-              icon={AmmoIcon}
-              label="Ammo"
-              value={stats?.stat_modifier_ammo ?? 0}
-              available={statModifiersAvailable}
-              complete={statModifiersComplete}
-              percent
-            />
-            <Bonus
-              icon={Shield}
-              label="Bullet Res"
-              value={stats?.stat_modifier_bullet_resist ?? 0}
-              available={statModifiersAvailable}
-              complete={statModifiersComplete}
-              percent
-            />
-            <Bonus
-              icon={ShieldHalf}
-              label="Spirit Res"
-              value={stats?.stat_modifier_spirit_resist ?? 0}
-              available={statModifiersAvailable}
-              complete={statModifiersComplete}
-              percent
-            />
-          </dl>
+        <CollapsibleSection
+          title="Statuses"
+          right={
+            status?.states?.length ? (
+              <span className="text-xs tabular-nums text-muted-foreground">
+                {status.states.length}
+              </span>
+            ) : undefined
+          }
+        >
+          <StatusList status={status} />
+        </CollapsibleSection>
+
+        <CollapsibleSection title="Permanent buffs">
+          <PermanentBuffs totals={permanentBuffs} />
+        </CollapsibleSection>
+
+        <CollapsibleSection title="Hero stats">
+          {catalog?.demoVersion && catalog.demoVersion !== catalog.version && (
+            <p className="mb-2 text-[10px] text-amber-500">Demo build {catalog.demoVersion} uses catalog {catalog.version}; calculated stats may differ.</p>
+          )}
+          <HeroStats
+            details={details}
+            abilities={abilities}
+            loading={detailsLoading}
+            error={detailsError}
+          />
         </CollapsibleSection>
       </div>
     </div>
@@ -641,6 +592,42 @@ function CollapsibleSection({
   );
 }
 
+function BarrierBar({
+  barrier,
+  maxBarrier,
+}: {
+  barrier: number;
+  maxBarrier: number;
+}) {
+  if (barrier <= 0) return null;
+  return (
+    <div className="mt-2 space-y-1 text-sky-400">
+      <div className="flex items-center justify-between gap-2 text-xs">
+        <span className="flex items-center gap-1">
+          <Shield className="size-3" />Barrier
+        </span>
+        <span className="tabular-nums">
+          {Math.round(barrier).toLocaleString()} / {Math.round(maxBarrier).toLocaleString()}
+        </span>
+      </div>
+      <div
+        role="progressbar"
+        aria-label="Barrier"
+        aria-valuemin={0}
+        aria-valuemax={maxBarrier}
+        aria-valuenow={barrier}
+        title={`${barrier.toFixed(1)} / ${maxBarrier.toFixed(1)} recorded barrier HP`}
+        className="h-2 overflow-hidden rounded-full bg-sky-400/15"
+      >
+        <div
+          className="h-full rounded-full bg-sky-400"
+          style={{ width: `${Math.min(100, 100 * barrier / maxBarrier)}%` }}
+        />
+      </div>
+    </div>
+  );
+}
+
 function HealthBar({
   health,
   maxHealth,
@@ -662,34 +649,6 @@ function HealthBar({
         className="h-full rounded-full transition-all"
         style={{ width: `${pct}%`, backgroundColor: fill }}
       />
-    </div>
-  );
-}
-
-function BarrierBar({
-  barrier,
-  maxHealth,
-}: {
-  barrier: number;
-  maxHealth: number;
-}) {
-  const remaining = Number.isFinite(barrier) ? Math.max(0, barrier) : 0;
-  const pct =
-    maxHealth > 0
-      ? Math.max(0, Math.min(1, remaining / maxHealth)) * 100
-      : 0;
-  return (
-    <div className="mt-1.5 space-y-1" title="Current barrier remaining">
-      <div className="flex items-center justify-between text-[10px] font-medium uppercase tracking-wide text-cyan-200/80">
-        <span>Barrier</span>
-        <span className="tabular-nums">{Math.round(remaining)}</span>
-      </div>
-      <div className="h-1.5 w-full overflow-hidden rounded-full bg-cyan-950/60">
-        <div
-          className="h-full rounded-full bg-cyan-300 transition-all"
-          style={{ width: `${pct}%` }}
-        />
-      </div>
     </div>
   );
 }
@@ -716,55 +675,308 @@ function LevelBars({ level, color }: { level: number; color: string }) {
   );
 }
 
-function Bonus({
-  icon: Icon,
-  label,
-  value,
-  percent,
-  available = true,
-  complete = true,
-}: {
-  icon: React.ComponentType<{ className?: string }>;
-  label: string;
-  value: number;
-  percent?: boolean;
-  available?: boolean;
-  complete?: boolean;
-}) {
-  const title = !available
-    ? "This replay does not expose recorded stat-modifier values"
-    : !complete
-      ? "The replay contains an unrecognized stat-modifier type"
-      : undefined;
+function QueryState({ loading, error }: { loading?: boolean; error?: string }) {
+  if (loading) {
+    return (
+      <p className="flex items-center gap-2 text-xs text-muted-foreground">
+        <Loader2 className="size-3.5 animate-spin" />
+        Calculating this tick with Boon…
+      </p>
+    );
+  }
+  if (error) {
+    return <p className="text-xs text-destructive">{error}</p>;
+  }
+  return <p className="text-xs text-muted-foreground">No data at this tick.</p>;
+}
+
+function statusLabel(value: string): string {
+  return value
+    .toLowerCase()
+    .split("_")
+    .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
+    .join(" ");
+}
+
+function statusIcon(value: string): string {
+  const name = value.toLowerCase();
+  if (name.includes("silenc")) return "condition_silence";
+  if (name.includes("stun")) return "condition_stun";
+  if (name.includes("sleep")) return "condition_sleep";
+  if (name.includes("immobil")) return "condition_immobilize";
+  if (name.includes("knock")) return "condition_knockdown";
+  if (name.includes("slow")) return "condition_slow";
+  if (name.includes("burn")) return "condition_burn";
+  if (name.includes("bleed")) return "condition_bleed";
+  if (name.includes("toxic") || name.includes("poison")) return "condition_toxic";
+  if (name.includes("curse")) return "condition_curse";
+  if (name.includes("obscur") || name.includes("invis")) return "visibility";
+  if (name.includes("invulner") || name.includes("immune")) return "armor";
+  if (name.includes("sprint")) return "move_sprint";
+  if (name.includes("slide")) return "move_slide";
+  if (name.includes("zipline")) return "zipline";
+  if (name.includes("dash")) return "move_dash";
+  return "spirit";
+}
+
+function StatusPills({ values }: { values: string[] }) {
   return (
-    <div title={title}>
-      <dt className="flex items-center gap-1 text-[10px] uppercase tracking-wide text-muted-foreground">
-        <Icon className="size-3" />
-        {label}
-      </dt>
-      <dd className="text-sm font-medium tabular-nums">
-        {!available ? (
-          "—"
-        ) : (
-          <>
-            {!complete && "~"}
-            {formatBonus(value)}
-            {percent ? "%" : ""}
-          </>
-        )}
-      </dd>
+    <div className="flex flex-wrap gap-1.5">
+      {values.map((value) => (
+        <span
+          key={value}
+          title={value}
+          className="flex items-center gap-1 rounded border border-border bg-muted/30 px-1.5 py-1 text-[10px]"
+        >
+          <img src={propertyIcon(statusIcon(value))} alt="" className="size-3 opacity-80" />
+          {statusLabel(value)}
+        </span>
+      ))}
     </div>
   );
 }
 
-function formatBonus(value: number): string {
-  // Stat-modifier values are floats; small magnitudes round nicely with 1
-  // decimal, larger values look better as integers.
-  if (value === 0) return "0";
-  const abs = Math.abs(value);
-  const rounded =
-    abs >= 100 ? Math.round(value) : Math.round(value * 10) / 10;
-  return rounded > 0 ? `+${rounded}` : `${rounded}`;
+function StatusList({
+  status,
+}: {
+  status?: PlayerStatus;
+}) {
+  if (!status?.states) return <p className="text-xs text-muted-foreground">No status data at this tick.</p>;
+  // This recorded view includes modifier and movement states. Don't invent
+  // precedence by merging the separate enabled/disabled inputs into it.
+  const unknown = status.unknown_states.length;
+  if (status.states.length === 0 && unknown === 0) {
+    return <p className="text-xs text-muted-foreground">No active statuses.</p>;
+  }
+  return (
+    <div className="space-y-2">
+      <StatusPills values={status.states} />
+      {unknown > 0 && (
+        <p className="text-[10px] text-amber-500">
+          {unknown} state bit{unknown === 1 ? "" : "s"} not named by this boon-data snapshot.
+        </p>
+      )}
+    </div>
+  );
+}
+
+const STAT_UNIT_SUFFIX: Record<string, string> = {
+  "%": "%",
+  multiplier: "×",
+  "m/s": " m/s",
+  m: " m",
+  s: "s",
+};
+
+function formatStat(value: number | undefined, unit: string): string {
+  if (value == null || !Number.isFinite(value)) return "—";
+  const rounded = Math.abs(value) >= 100 ? value.toFixed(0) : value.toFixed(1).replace(/\.0$/, "");
+  return `${rounded}${STAT_UNIT_SUFFIX[unit] ?? ""}`;
+}
+
+export function PermanentBuffs({ totals }: { totals?: PickupTotals }) {
+  if (!totals) return <p className="text-xs text-muted-foreground">No pickup data at this tick.</p>;
+  return (
+    <dl className="grid grid-cols-3 gap-1.5">
+      {PICKUP_STATS.map((stat, index) => {
+        const count = totals.counts[index];
+        return (
+          <Tooltip key={stat.label}>
+            <TooltipTrigger asChild>
+              <div tabIndex={0} className="rounded border border-border bg-muted/20 px-2 py-1.5">
+                <dt className="flex items-center gap-1 text-[9px] text-muted-foreground">
+                  <img src={propertyIcon(stat.icon)} alt="" className="size-3.5" />
+                  <span>{stat.label}</span>
+                </dt>
+                <dd className="text-sm font-semibold tabular-nums">+{formatStat(totals.values[index], stat.unit)}</dd>
+                <dd className="text-[9px] text-muted-foreground">{count == null ? "Count unavailable" : `${count} pickup${count === 1 ? "" : "s"}`}</dd>
+              </div>
+            </TooltipTrigger>
+            <TooltipContent className="max-w-64">
+              Cumulative {stat.label.toLowerCase()} from permanent pickups only, not items or level growth.
+              {" "}Final hero stats may use different stacking rules. Counts use boon-data’s tier values.
+            </TooltipContent>
+          </Tooltip>
+        );
+      })}
+    </dl>
+  );
+}
+
+function ContributionList({ rows, unit }: { rows: StatContribution[]; unit: string }) {
+  rows = visibleContributions(rows);
+  if (!rows.length) return <p className="text-muted-foreground">No explanation rows.</p>;
+  return (
+    <ul className="mt-1 space-y-1 border-t border-border/60 pt-1">
+      {rows.slice(0, 12).map((row, index) => (
+        <li key={`${row.source}:${row.input}:${index}`} title={`${row.source}\n${row.definition_path}`} className="flex justify-between gap-3">
+          <span className="min-w-0">
+            {contributionSource(row)}
+            {contributionSource(row) !== "Category bonus" && (
+              <span className="block text-muted-foreground">{contributionLabel(row)}</span>
+            )}
+          </span>
+          <span className="shrink-0 tabular-nums">{contributionValue(row, unit)}</span>
+        </li>
+      ))}
+      {rows.length > 12 && <li className="text-muted-foreground">{rows.length - 12} more inputs.</li>}
+    </ul>
+  );
+}
+
+function HeroStatTile({ row, contributions }: { row: HeroStatRow; contributions: StatContribution[] }) {
+  const meta = HERO_STAT_META[row.stat];
+  if (!meta) return null;
+  const diagnostic = statDiagnostic(row.diagnostic);
+  return (
+    <Tooltip>
+      <TooltipTrigger asChild>
+        <div className="rounded border border-border bg-muted/20 px-2 py-1.5">
+          <dt className="flex items-center gap-1 text-[9px] uppercase tracking-wide text-muted-foreground">
+            <img src={propertyIcon(meta.icon)} alt="" className="size-3.5 opacity-80" />
+            <span className="truncate">{meta.label}</span>
+          </dt>
+          <dd className="mt-0.5 text-sm font-semibold tabular-nums">
+            {row.status === "partial" && <span className="text-amber-500">~</span>}
+            {formatStat(row.value, row.unit)}
+          </dd>
+        </div>
+      </TooltipTrigger>
+      <TooltipContent className="max-w-80 text-[10px]">
+        <p className="font-semibold">{meta.label}: {formatStat(row.value, row.unit)}</p>
+        {diagnostic && <p className="mt-1 text-amber-300">{diagnostic}</p>}
+        {!diagnostic && row.status === "partial" && <p className="mt-1 text-amber-300">Boon marks this value partial; engine-only warnings are hidden.</p>}
+        <ContributionList rows={contributions.filter((value) => value.stat === row.stat)} unit={row.unit} />
+        {["bullet_resist", "spirit_resist", "melee_resist"].includes(row.stat) && <p className="mt-2 text-muted-foreground">{RESISTANCE_EXPLANATION}</p>}
+      </TooltipContent>
+    </Tooltip>
+  );
+}
+
+function AbilityStatTile({
+  row,
+  contributions,
+}: {
+  row: AbilityStatRow;
+  contributions: AbilityContribution[];
+}) {
+  const meta = ABILITY_STAT_META[row.stat];
+  if (!meta) return null;
+  const diagnostic = statDiagnostic(row.diagnostic);
+  const breakdown = contributions.filter(
+    (value) => value.ability_id === row.ability_id && value.stat === row.stat,
+  );
+  return (
+    <Tooltip>
+      <TooltipTrigger asChild>
+        <div className="flex flex-col items-center rounded border border-border bg-muted/20 p-1">
+          <img src={propertyIcon(meta.icon)} alt="" className="size-3.5 opacity-80" />
+          <span className="text-[10px] font-semibold tabular-nums">
+            {row.status === "partial" && <span className="text-amber-500">~</span>}
+            {formatStat(row.value, row.unit)}
+          </span>
+        </div>
+      </TooltipTrigger>
+      <TooltipContent className="max-w-80 text-[10px]">
+        <p className="font-semibold">{meta.label}: {formatStat(row.value, row.unit)}</p>
+        {diagnostic && <p className="mt-1 text-amber-300">{diagnostic}</p>}
+        {!diagnostic && row.status === "partial" && <p className="mt-1 text-amber-300">Boon marks this value partial; engine-only warnings are hidden.</p>}
+        {breakdown.length ? (
+          <ul className="mt-1 space-y-1 border-t border-border/60 pt-1">
+            {breakdown.slice(0, 12).map((value, index) => (
+              <li key={`${value.source}:${index}`} className="flex justify-between gap-3">
+                <span className="min-w-0" title={`${value.source}\n${value.definition_path}`}>
+                  {statSourceLabel(value.source)} · {value.state}{value.included ? "" : " (not applied)"}
+                </span>
+                <span className="shrink-0 tabular-nums">
+                  {value.value == null ? "—" : `${value.value.toFixed(2)}${STAT_UNIT_SUFFIX[row.unit] ?? ""}`}
+                </span>
+              </li>
+            ))}
+          </ul>
+        ) : (
+          <p className="mt-1 text-muted-foreground">No explanation rows.</p>
+        )}
+      </TooltipContent>
+    </Tooltip>
+  );
+}
+
+function HeroStats({
+  details,
+  abilities,
+  loading,
+  error,
+}: {
+  details?: PlayerDetails;
+  abilities?: AbilitySlot[];
+  loading?: boolean;
+  error?: string;
+}) {
+  if (!details) return <QueryState loading={loading} error={error} />;
+  const rows = new Map(details.hero_stats.values.map((row) => [row.stat, row]));
+  const groups: { id: ItemCategory; label: string }[] = [
+    { id: "weapon", label: "Weapon" },
+    { id: "vitality", label: "Vitality" },
+    { id: "spirit", label: "Spirit" },
+  ];
+  return (
+    <div className="space-y-3">
+      {groups.map((group) => {
+        const groupRows = Object.entries(HERO_STAT_META)
+          .filter(([, meta]) => meta.group === group.id)
+          .map(([stat]) => rows.get(stat))
+          .filter((row): row is HeroStatRow => row != null);
+        return (
+          <div key={group.id}>
+            <h4
+              className="mb-1 text-[10px] font-semibold uppercase tracking-wide"
+              style={{ color: CATEGORY_COLORS[group.id] }}
+            >
+              {group.label}
+            </h4>
+            {groupRows.length > 0 && (
+              <dl className="grid grid-cols-2 gap-1.5">
+                {groupRows.map((row) => (
+                  <HeroStatTile
+                    key={row.stat}
+                    row={row}
+                    contributions={details.hero_stats.contributions}
+                  />
+                ))}
+              </dl>
+            )}
+            {group.id === "spirit" && (
+              <div className="mt-2 space-y-2">
+                {(abilities ?? []).map((ability) => {
+                  const abilityRows = details.ability_stats.values.filter(
+                    (row) => row.ability_id === ability.ability_id,
+                  );
+                  return (
+                    <div key={ability.ability_id} className="rounded border border-border p-1.5">
+                      <div className="mb-1 flex items-center gap-1.5 text-[10px] font-medium">
+                        <AbilityIcon name={ability.ability_name} size={18} />
+                        <span className="truncate">{prettifyAbilityName(ability.ability_name)}</span>
+                      </div>
+                      <div className="grid grid-cols-5 gap-1">
+                        {abilityRows.map((row) => (
+                          <AbilityStatTile
+                            key={row.stat}
+                            row={row}
+                            contributions={details.ability_stats.contributions}
+                          />
+                        ))}
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+          </div>
+        );
+      })}
+    </div>
+  );
 }
 
 // Reconstruct a readable label + icon hint from a span's source. Items are the

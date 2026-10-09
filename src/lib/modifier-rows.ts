@@ -10,6 +10,48 @@ export type ModifierRow = {
   incoming: boolean;
 };
 
+/** Display-only exclusions. Keep raw modifiers and Boon's calculations intact. */
+export const IGNORED_MODIFIERS: Readonly<Record<string, string>> = {
+  modifier_citadel_pre_match_wait: "Engine pre-match waiting state, not a combat effect.",
+};
+
+export function isIgnoredModifier(name: string): boolean {
+  return Object.hasOwn(IGNORED_MODIFIERS, name.split("/").at(-1) ?? name);
+}
+
+/** Hide only allowlisted missing-definition warnings, never other stat errors. */
+export function statDiagnostic(diagnostic?: string): string | undefined {
+  if (!diagnostic) return diagnostic;
+  let inIgnored = false;
+  let needsHeading = false;
+  const visible = diagnostic.split("; ").flatMap((part) => {
+    if (part.startsWith("ignored modifiers: ")) {
+      inIgnored = true;
+      needsHeading = true;
+      part = part.slice("ignored modifiers: ".length);
+    }
+    const missing = part.match(/^modifier ID \d+ \(([^)]+)\) has no stat definition$/);
+    if (inIgnored && missing && isIgnoredModifier(missing[1])) return [];
+    if (inIgnored && /^(?:modifier ID|unresolved modifier ID|ambiguous modifier ID) /.test(part)) {
+      const heading = needsHeading ? "ignored modifiers: " : "";
+      needsHeading = false;
+      return [heading + part];
+    }
+    inIgnored = false;
+    return [part];
+  });
+  return visible.join("; ") || undefined;
+}
+
+/** Permanent pickup bonuses belong in stat breakdowns, not the effect list. */
+export function isPermanentStatPickup(modifier: {
+  ability_name: string;
+  modifier_name: string;
+}): boolean {
+  return modifier.modifier_name.split("/").pop() === "modifier_permanent_pickup" ||
+    /(?:^|_)permanent_pickup(?:_lv\d+)?$/.test(modifier.ability_name);
+}
+
 /**
  * Boon preserves the game's low-level modifier serials. Summarize serials from
  * the same ability and caster because they otherwise render as indistinguishable

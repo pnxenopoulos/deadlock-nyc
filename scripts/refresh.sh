@@ -9,19 +9,22 @@ export PATH="$HOME/.bun/bin:$HOME/.cargo/bin:$PATH"
 
 cd "$ROOT_DIR"
 
-echo "[1/5] Refreshing manifests from GameTracking..."
+echo "[1/6] Refreshing manifests from GameTracking..."
 bun run sync
 
-echo "[2/5] Extracting referenced images from the local Deadlock install..."
+echo "[2/6] Building the embedded Boon name catalog..."
+bun run catalog
+
+echo "[3/6] Extracting referenced images from the local Deadlock install..."
 bun run extract-images
 
-echo "[3/5] Optimizing images..."
+echo "[4/6] Optimizing images..."
 bun run images
 
-echo "[4/5] Rebuilding the Boon WebAssembly module..."
+echo "[5/6] Rebuilding the Boon WebAssembly module..."
 bun run wasm
 
-echo "[5/5] Verifying the production build..."
+echo "[6/6] Verifying the production build..."
 bun run build
 
 echo "Refresh complete. Review the generated changes with: git status --short"

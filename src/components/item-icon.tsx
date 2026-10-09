@@ -35,12 +35,14 @@ export function ItemIcon({
   size = 14,
   className,
   style,
+  tooltip = true,
 }: {
   abilityId: number;
   abilityName: string;
   size?: number;
   className?: string;
   style?: React.CSSProperties;
+  tooltip?: boolean;
 }) {
   // The manifest built from abilities.vdata maps each ability name straight to a
   // precise icon URL (the optimized WebP under public/items). Anything not in
@@ -52,21 +54,15 @@ export function ItemIcon({
   const [broken, setBroken] = React.useState(false);
   React.useEffect(() => {
     setBroken(false);
-  }, [abilityId]);
+  }, [abilityId, abilityName]);
 
-  if (!manifestUrl || broken) {
-    return (
-      <IconTooltip label={label || `id ${abilityId}`}>
-        <div
-          style={{ width: size, height: size, ...style }}
-          className={cn("rounded bg-muted/60", className)}
-        />
-      </IconTooltip>
-    );
-  }
-
-  return (
-    <IconTooltip label={label}>
+  const icon =
+    !manifestUrl || broken ? (
+      <div
+        style={{ width: size, height: size, ...style }}
+        className={cn("rounded bg-muted/60", className)}
+      />
+    ) : (
       <img
         key={abilityId}
         src={manifestUrl}
@@ -78,7 +74,11 @@ export function ItemIcon({
         style={{ width: size, height: size, ...style }}
         className={cn("rounded object-contain", className)}
       />
-    </IconTooltip>
+    );
+  return tooltip ? (
+    <IconTooltip label={label || `id ${abilityId}`}>{icon}</IconTooltip>
+  ) : (
+    icon
   );
 }
 

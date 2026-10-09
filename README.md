@@ -32,10 +32,16 @@ and renders the parsed entities, events, and stats in the browser.
 - **Keyboard shortcuts** — `Space` play/pause, `←` / `→` back/forward, `Esc`
   to close dialogs.
 - **Event feeds** (tabbed) — kills, ability usage, objectives (destructions,
-  Mid-Boss, urn spawns, Rift lifecycle), and team-colored chat. Click any row
+  Mid-Boss, Urn spawns/pickups/drops/returns, Rift lifecycle), and team-colored chat. Click any row
   to seek.
-- **Player detail panel** — health and barrier, abilities, item investments,
-  active modifiers, and expanded combat stats including resistances and lifesteal.
+- **Player detail panel** — health and barrier, abilities, item investments, active
+  modifiers, current player statuses, ability imbues, and Boon-calculated
+  weapon, vitality, spirit, and per-ability stats with input breakdowns.
+  Permanent pickup bonuses and counts are indexed for immediate seeking.
+- **Timeline stats** — self/teammate healing, healing and regeneration by source, damage taken,
+  mitigation, barrier absorption, and creep/objective damage.
+- **Lane phase** — recorded starting assignments, individual/pair totals, and
+  an adjustable cutoff. Uses the previous summary sample, without interpolation.
 - **Dark / light themes.**
 
 ## Tech stack
@@ -43,21 +49,30 @@ and renders the parsed entities, events, and stats in the browser.
 - [React 19](https://react.dev/) + [TypeScript](https://www.typescriptlang.org/)
 - [Vite 6](https://vite.dev/) + [Tailwind CSS 4](https://tailwindcss.com/)
 - [Bun](https://bun.sh/) (package manager + script runner)
-- [boon](https://github.com/pnxenopoulos/boon) (Rust) compiled to WebAssembly
-  with [`wasm-pack`](https://github.com/rustwasm/wasm-pack)
+- [boon](https://github.com/pnxenopoulos/boon) 0.15 (Rust), published on crates.io and compiled to
+  WebAssembly with [`wasm-pack`](https://github.com/rustwasm/wasm-pack)
 
 ## Performance and memory
 
-The WASM adapter uses boon 0.9 and pbdems2 0.3. It requests only the event
+The WASM adapter uses Boon 0.15 and pbdems2 0.3.6. It requests only the event
 types used by the UI and uses boon's changed-entity indices for roster and
 objective updates instead of rescanning every live entity each tick.
 
-Parsing runs in a disposable Web Worker. The demo buffer and packed result
-columns are transferred rather than cloned, and the worker is terminated after
-the parse so its WASM linear memory is returned to the browser. Sampled frames
-remain in typed arrays; the UI materializes only the current and next playback
-frames, while heatmaps and derived stats scan the compact player columns
-directly.
+One Web Worker retains the parser and stat checkpoints for the loaded demo.
+The demo buffer and packed result columns are transferred rather than cloned.
+Closing or replacing the demo terminates the worker and releases its WASM heap.
+Sampled frames remain in typed arrays; the UI materializes only the current and
+next playback frames, while heatmaps and derived stats scan the compact player
+columns directly.
+
+Player-detail queries use Boon's catalog-byte loaders and single-pass stat
+batches. The viewer uses Boon's Deadlock coordinate helpers directly; no
+vendored parser or coordinate-origin detection is needed.
+
+Replay modifiers and Urn carriers use Boon's shared catalog lifetime rules,
+ordered updates, and full-handle validation. No six-player suppression, guessed
+Urn pickup, or fixed carry timeout is applied. Untimed Grapple Arm parents remain
+unresolved; the viewer does not invent an expiry.
 
 ## Getting started
 
@@ -82,7 +97,23 @@ bun run dev      # start the dev server
 
 `src/wasm/pkg` is generated and not committed, so **`bun run wasm` must be run
 once before `bun run dev` / `bun run build`** (and again whenever `wasm/src`
-changes).
+or its Cargo dependencies change).
+
+### Stat-query performance checks
+
+Normal builds use Boon 0.15's published checkpoint API. Demo loading prepares
+up to 16 exact replay checkpoints once; repeated stat queries resume from the
+nearest earlier checkpoint. Recorded statuses are indexed once and update
+immediately. Superseded stat requests are coalesced, and recent results are cached.
+The viewer selects a bundled catalog matching the demo header (6746 or 6759).
+Other builds use the latest bundled snapshot with a mismatch warning.
+
+Compare exact uncached and checkpoint-backed queries on the test demo:
+
+```bash
+bun run wasm
+bun scripts/benchmark-player-details.ts 111155916.dem
+```
 
 ### Build for production
 
@@ -90,6 +121,13 @@ changes).
 bun run wasm
 bun run build    # tsc -b && vite build → dist/
 bun run preview  # serve the production build locally
+```
+
+With a local test demo, check the browser parser, map coordinates, and player
+details using the generated WASM module:
+
+```bash
+bun run check-demo -- 111155916.dem 73952
 ```
 
 ## Project structure

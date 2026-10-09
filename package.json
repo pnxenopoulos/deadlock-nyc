@@ -5,11 +5,15 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
-    "build": "tsc -b && vite build",
+    "build": "bun run check-portraits && bun run check-ability-icons && tsc -b && vite build",
     "preview": "vite preview",
-    "wasm": "wasm-pack build wasm --target web --out-dir ../src/wasm/pkg --out-name boon_wasm",
+    "check-demo": "bun run scripts/check-demo.ts",
+    "check-portraits": "bun run scripts/check-hero-portraits.ts",
+    "check-ability-icons": "bun run scripts/check-ability-icons.ts",
+    "wasm": "wasm-pack build wasm --target web --out-dir ../src/wasm/pkg --out-name boon_wasm -- --locked",
     "refresh": "bash scripts/refresh.sh",
     "sync": "bash scripts/sync-game-data.sh",
+    "catalog": "bun run scripts/build-boon-catalog.ts",
     "extract-images": "bun run scripts/extract-game-images.ts",
     "items": "bun run scripts/build-item-manifest.ts",
     "item-names": "bun run scripts/build-item-names.ts",
@@ -17,6 +21,7 @@
     "portraits": "bun run scripts/build-hero-portraits.ts",
     "ability-icons": "bun run scripts/build-ability-icons.ts",
     "ability-names": "bun run scripts/build-ability-names.ts",
+    "property-icons": "bun run scripts/build-images.ts --properties-only",
     "images": "bun run scripts/build-images.ts"
   },
   "dependencies": {

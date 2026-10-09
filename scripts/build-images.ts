@@ -3,15 +3,15 @@
 //
 // panorama/images/ is a full Source 2 Viewer dump (tens of MB, many subtrees we
 // never touch). The app only ever serves a small subset, and it knows exactly
-// which files — they're named in the generated manifests plus one hardcoded
-// minimap list. This script reads that set, so it copies precisely what ships
+// which files — they're named in the generated manifests. This script reads
+// that set, so it copies precisely what ships
 // and nothing else.
 //
 // "The ones we need" = the union of:
 //   - src/data/item-icons.json     values  (/items/<cat>/foo_psd.webp)
 //   - src/data/hero-portraits.json values  (/heroes/foo_sm_psd.webp)
 //   - src/data/ability-icons.json  values  (/hud/abilities/... , /upgrades/...)
-//   - the two minimap layers map-view.tsx hardcodes
+//   - src/data/minimap-images.json layers
 //   - competitive textures under ranked/badges/rankXX_lg_psd.vtex_c
 //
 // Each *served* URL is .webp (our optimized output). Its panorama *source* is
@@ -33,12 +33,16 @@
 //   --dry-run    show what would be written/pruned, touch nothing
 //   --no-prune   keep files we didn't produce in dirs we wrote into
 //   --force      re-encode even when the WebP is newer than its source
+//   --heroes-only  update only hero portraits
+//   --abilities-only  update only ability icons
+//   --minimap-only  update only map layers
 //
 // After a patch: re-export panorama/ on the Deadlock machine, `bun run sync`
 // to refresh the manifests, then `bun run images`.
 
 import {
   existsSync,
+  copyFileSync,
   lstatSync,
   mkdirSync,
   mkdtempSync,
@@ -51,6 +55,7 @@ import {
 import { tmpdir } from "node:os";
 import { basename, dirname, join, relative, resolve, sep } from "node:path";
 import { findSource2ViewerCli, source2ViewerEnv } from "./source2viewer";
+import minimapImages from "../src/data/minimap-images.json";
 
 const ROOT = resolve(import.meta.dir, "..");
 const PANORAMA = process.env.PANORAMA_DIR
@@ -59,10 +64,18 @@ const PANORAMA = process.env.PANORAMA_DIR
 const PUBLIC = resolve(ROOT, "public");
 const RANK_BADGES = join(PANORAMA, "ranked/badges");
 const RANK_MANIFEST = resolve(ROOT, "src/data/rank-icons.json");
+const PROPERTY_ICONS = join(PANORAMA, "icons/properties");
+const PUBLIC_PROPERTY_ICONS = join(PUBLIC, "icons/properties");
 
 const DRY_RUN = process.argv.includes("--dry-run");
-const NO_PRUNE = process.argv.includes("--no-prune");
 const FORCE = process.argv.includes("--force");
+const PROPERTIES_ONLY = process.argv.includes("--properties-only");
+const HEROES_ONLY = process.argv.includes("--heroes-only");
+const ABILITIES_ONLY = process.argv.includes("--abilities-only");
+const MINIMAP_ONLY = process.argv.includes("--minimap-only");
+// Scoped refreshes can share directories with other manifests (item actives,
+// for example). Only the complete build can safely prune unproduced files.
+const NO_PRUNE = process.argv.includes("--no-prune") || HEROES_ONLY || ABILITIES_ONLY || MINIMAP_ONLY;
 
 // Manifests whose *values* are served URLs. build-images mirrors each into a
 // public/ WebP; the generators (build-{item,ability}-manifest, portraits) own
@@ -84,18 +97,11 @@ const RULES: Record<string, { width: number; quality: number }> = {
   minimap: { width: 0, quality: 82 },
 };
 
-// Minimap layers aren't in any manifest — map-view.tsx hardcodes them. They're
-// served flat under /minimap/ but exported under panorama minimap/base/.
-const MINIMAP: { url: string; sourceRel: string }[] = [
-  {
-    url: "/minimap/minimap_midtown_mid_psd_dd4bcbf9.webp",
-    sourceRel: "minimap/base/minimap_midtown_mid_psd_dd4bcbf9.png",
-  },
-  {
-    url: "/minimap/minimap_midtown_mid_tunnels_psd.webp",
-    sourceRel: "minimap/base/minimap_midtown_mid_tunnels_psd.png",
-  },
-];
+// Map backgrounds use a flat served URL but are exported under minimap/base/.
+const MINIMAP = Object.values(minimapImages).map((layer) => ({
+  url: layer.src,
+  sourceRel: layer.sourceRel,
+}));
 
 interface Job {
   /** served URL, e.g. /items/weapon/foo_psd.webp */
@@ -210,6 +216,40 @@ async function writeRankManifest(jobs: Job[]) {
   );
 }
 
+function copyPropertyIcons() {
+  if (!existsSync(PROPERTY_ICONS)) {
+    console.warn("Property icons not found; skipping stat icons.");
+    return;
+  }
+  const names = readdirSync(PROPERTY_ICONS)
+    .filter((name) => name.endsWith(".svg"))
+    .sort();
+  ensureRealDir(PUBLIC_PROPERTY_ICONS);
+  const produced = new Set(names.map((name) => resolve(PUBLIC_PROPERTY_ICONS, name)));
+  let copied = 0;
+  for (const name of names) {
+    const source = join(PROPERTY_ICONS, name);
+    const dest = join(PUBLIC_PROPERTY_ICONS, name);
+    if (!FORCE && existsSync(dest) && statSync(dest).mtimeMs >= statSync(source).mtimeMs) {
+      continue;
+    }
+    copied++;
+    if (!DRY_RUN) copyFileSync(source, dest);
+  }
+  let pruned = 0;
+  if (!NO_PRUNE) {
+    for (const file of filesIn(PUBLIC_PROPERTY_ICONS)) {
+      if (produced.has(resolve(file))) continue;
+      pruned++;
+      if (!DRY_RUN) unlinkSync(file);
+    }
+  }
+  console.log(
+    `  ${DRY_RUN ? "would copy" : "copied"} ${copied} property SVG(s)` +
+      (pruned ? `; ${DRY_RUN ? "would prune" : "pruned"} ${pruned}` : ""),
+  );
+}
+
 function buildJobs(): Job[] {
   const urls = new Set<string>();
   for (const m of MANIFESTS) for (const u of readManifestUrls(m)) urls.add(u);
@@ -270,6 +310,14 @@ async function encode(job: Job): Promise<number> {
   }
 
   const args = ["-quiet", "-q", String(rule.quality)];
+  if (job.category === "heroes" && input.endsWith("_vertical_psd.png")) {
+    const png = readFileSync(input);
+    const width = png.readUInt32BE(16);
+    const height = png.readUInt32BE(20);
+    const size = Math.min(width, height);
+    args.push("-crop", String(Math.floor((width - size) / 2)),
+      String(Math.floor((height - size) / 2)), String(size), String(size));
+  }
   if (rule.width > 0) args.push("-resize", String(rule.width), "0");
   args.push(input, "-o", job.dest);
 
@@ -326,6 +374,16 @@ function categoryOf(absDir: string): string {
 }
 
 async function main() {
+  if ([PROPERTIES_ONLY, HEROES_ONLY, ABILITIES_ONLY, MINIMAP_ONLY].filter(Boolean).length > 1) {
+    die("Choose only one image scope flag");
+  }
+  if (PROPERTIES_ONLY) {
+    if (!existsSync(PANORAMA)) {
+      die(`panorama dir not found: ${PANORAMA}`);
+    }
+    copyPropertyIcons();
+    return;
+  }
   if (!DRY_RUN && !(await haveCwebp())) {
     die(
       "`cwebp` not found on PATH. Install the WebP tools package " +
@@ -337,6 +395,10 @@ async function main() {
   }
 
   let jobs = buildJobs();
+  const abilityUrls = new Set(readManifestUrls("src/data/ability-icons.json"));
+  if (HEROES_ONLY) jobs = jobs.filter((job) => job.category === "heroes");
+  if (ABILITIES_ONLY) jobs = jobs.filter((job) => abilityUrls.has(job.url));
+  if (MINIMAP_ONLY) jobs = jobs.filter((job) => job.category === "minimap");
 
   if (
     !DRY_RUN &&
@@ -354,6 +416,12 @@ async function main() {
   // raster (e.g. *.svg icons cwebp can't read). Warn and skip them rather than
   // aborting — they'll fall back to a placeholder in the UI.
   const missing = jobs.filter((j) => !existsSync(j.source));
+  const missingIcons = missing.filter((job) =>
+    job.category === "heroes" || job.category === "minimap" || abilityUrls.has(job.url));
+  if (missingIcons.length) {
+    die(`Missing hero, ability or map images: ${missingIcons.map((job) => job.url).join(", ")}. ` +
+      "Run `bun run extract-images` first.");
+  }
   if (missing.length) {
     console.warn(`Skipping ${missing.length} referenced image(s) absent from ${relative(ROOT, PANORAMA)}:`);
     for (const j of missing.slice(0, 10)) console.warn(`  ${relative(PANORAMA, j.source)}  (for ${j.url})`);
@@ -438,6 +506,7 @@ async function main() {
   }
 
   await writeRankManifest(jobs);
+  if (!HEROES_ONLY && !ABILITIES_ONLY && !MINIMAP_ONLY) copyPropertyIcons();
 
   console.log(DRY_RUN ? "Dry run complete — nothing written." : "Done.");
 }

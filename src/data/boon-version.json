@@ -1,0 +1,8 @@
+{
+  "client_version": "6759",
+  "source_commit": "bde801584553327b750f07de774da93f442389de",
+  "supported_versions": [
+    "6759",
+    "6746"
+  ]
+}

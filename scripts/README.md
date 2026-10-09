@@ -11,9 +11,10 @@ On the WSL development machine, run:
 bun run refresh
 ```
 
-This pulls the latest GameTracking data, extracts only referenced images from
-the installed Windows game, optimizes them, rebuilds the Boon WASM module, and
-verifies the production build. It auto-detects the current local paths:
+This pulls the latest GameTracking data, embeds the matching Boon catalogs,
+extracts only referenced images plus the property-icon set from the installed
+Windows game, optimizes them, rebuilds the Boon WASM module, and verifies the
+production build. It auto-detects the current local paths:
 
 - Source 2 Viewer: `../cli-linux-x64/Source2Viewer-CLI`
 - Deadlock: Windows Steam libraries mounted under `/mnt/<drive>/`
@@ -26,13 +27,14 @@ the extraction concurrency.
 
 | Data | Source of truth | Refreshed by |
 | --- | --- | --- |
-| Hero **display names** | `boon` crate (`heroes.rs`) | bump `boon`, then `bun run wasm` |
+| Demo names, calculated stats, imbues, and player-state names | versioned `boon-data` catalogs | `boon get <version>`, then `bun run catalog` |
+| Stat and status **icons** | Deadlock `panorama/images/icons/properties/` | `bun run extract-images` → `bun run property-icons` (also included in `bun run images`) |
 | Item **icon paths** (name → `.png`) | `abilities.vdata` `m_strShopIconLarge` | `bun run sync` → `src/data/item-icons.json` |
 | Item **display names** (name → "Extra Charge") | `citadel_gc_mod_names_english.txt` | `bun run sync` → `src/data/item-names.json` |
 | Item **category + cost** (name → gun/vitality/spirit, souls) | `abilities.vdata` `m_eItemSlotType` + `m_iItemTier`; tier→cost is hardcoded in the script | `bun run sync` → `src/data/item-stats.json` |
-| Hero **portrait paths** (id → `.webp`) | `heroes.vdata` `m_strIconImageSmall` | `bun run sync` → `src/data/hero-portraits.json` |
-| Ability/item-active **icon paths** (name → `.webp`) | `abilities.vdata` `m_strAbilityImage` | `bun run sync` → `src/data/ability-icons.json` |
-| Ability **display names** (internal id → in-game English) | `citadel_heroes_english.txt` + `citadel_gc_mod_names_english.txt` | `bun run sync` → `src/data/ability-names.json` |
+| Hero **portrait paths** (id → `.webp`) | installed `heroes.vdata`, preferring small portraits with minimap/vertical/card fallbacks | `bun run extract-images` → `src/data/hero-portraits.json` (`bun run sync` also generates an initial manifest) |
+| Ability/item-active **icon paths** (name → `.webp`) | installed `abilities.vdata` `m_strAbilityImage` | `bun run extract-images` → `src/data/ability-icons.json` (`bun run sync` also generates an initial manifest) |
+| Ability **display names** (internal id → in-game English) | installed `citadel_heroes_english.txt` + `citadel_gc_mod_names_english.txt` | `bun run extract-images` → `src/data/ability-names.json` (`bun run sync` also generates an initial manifest) |
 | Competitive **rank badges** (packed rank → tier `.webp`) | `panorama/images/ranked/badges/rankXX_lg_psd.vtex_c` | `bun run images` → `public/ranks/` + `src/data/rank-icons.json` |
 | Item / hero / ability / minimap **images** | game VPKs | `bun run extract-images`, then `bun run images` → `public/` |
 
@@ -76,13 +78,50 @@ installed and require Source 2 Viewer plus `cwebp` (Ubuntu:
 Viewer for only the referenced textures. On WSL it reads the Windows VPK
 directly through `/mnt/<drive>/`; no game copy or Windows CLI is needed. It
 writes decompiled PNGs to the gitignored `panorama/images/` tree and retains
-compiled rank textures for the rank pipeline.
+compiled rank textures for the rank pipeline. It first refreshes hero and
+ability definitions from that same VPK plus the installation's loose English
+localization files, so GameTracking lag cannot omit new heroes or abilities.
+Vertical portraits are cropped to square icons; development slots without
+portraits use Valve's generic image. The portrait, ability-icon, and
+ability-name generators reuse installed definitions when available, unless
+`VDATA_DIR` is set explicitly.
 
 ```bash
 bun run extract-images
 bun run images --dry-run
 bun run images
+bun run check-portraits
+bun run check-ability-icons
 ```
+
+The production build also checks every Boon catalog hero has a mapping and
+every mapped hero/ability WebP exists. Missing hero or ability source images
+fail the image build instead of silently leaving broken icons.
+
+To refresh only hero portraits without touching item or ability images:
+
+```bash
+bun run extract-images --heroes-only
+bun run images --heroes-only
+```
+
+For ability icons and their English names only:
+
+```bash
+bun run extract-images --abilities-only
+bun run images --abilities-only
+```
+
+For the surface and tunnels map images only:
+
+```bash
+bun run extract-images --minimap-only
+bun run images --minimap-only
+```
+
+Map paths are shared by the viewer and both scripts in
+`src/data/minimap-images.json`. Scoped refreshes do not prune files used by
+other manifests.
 
 `bun run extract-images` and `bun run images` are the image-only workflow.
 `bun run refresh` also refreshes manifests, WASM, and the production build.
@@ -107,18 +146,44 @@ temporary PNG before WebP encoding. All six subdivisions share their tier's
 badge: `rank06_lg_psd.vtex_c` becomes `public/ranks/06.webp`, and packed ranks
 `61` through `66` all map to that URL in `src/data/rank-icons.json`.
 
-## Tier 3 — parser name tables (the `boon` crate)
+## Tier 3 — Boon parser catalogs
 
-Hero names and the internal ability identifiers attached to demo events come
-from `boon::hero_name` / `boon::ability_name`. Refresh them in the `boon` repo
-(`scripts/sync-name-tables.sh`), publish, bump the version in `wasm/Cargo.toml`,
-and run `bun run wasm`. Boon 0.8 also owns modifier-value aliases through
-`decode_stat_modifier_value_type`. User-facing English ability labels are
-refreshed separately by `bun run sync` from Valve's localization files.
+Boon 0.15 resolves demo IDs and calculates current hero/ability stats, imbues,
+and player states from versioned `boon-data` JSON catalogs. The browser cannot
+read Boon's normal filesystem cache, so deadlock.nyc generates its compact
+name lookup and copies the matching catalogs into `public/boon-data/` for the
+replay worker. Replay modifiers need the same catalog
+lifetime rules as stat queries:
+
+```bash
+boon get 6759       # only needed when that version is not already installed
+boon get 6746       # matching snapshot for the regression demo
+bun run catalog     # writes metadata, name lookup, and browser catalogs
+bun run wasm
+```
+
+The generator reads `~/.boon/<version>/` by default. Set `BOON_DATA_DIR` to a
+different cache root or `BOON_CLIENT_VERSION` to override the version. It uses
+the `boon-proto` build number in `wasm/Cargo.lock` by default and rejects mixed
+catalog snapshots. `bun run refresh` runs the catalog step automatically.
+User-facing English ability labels remain separate and come from Valve's
+localization via `bun run sync`.
+
+`bun run catalog` also generates `src/data/hero-names.json` for stat-breakdown
+source labels and `src/data/ability-id-names.json` for ID-based imbue icons.
+Display-only modifier exclusions live in `IGNORED_MODIFIERS` in
+`src/lib/modifier-rows.ts`; these suppress effect rows and known missing-definition
+warnings, without changing raw replay data, stat totals, or Boon's partial status.
+
+The browser adapter uses the published `boon-deadlock` crate. Catalog-byte
+loading, stat-tagged contributions, single-pass stat batches, and replay
+checkpoints are upstream APIs; no local Boon checkout is needed.
 
 ## Full post-patch checklist
 
-1. Update the `boon` dependency if parser names or modifier aliases changed.
-2. Run `bun run refresh`.
-3. Review `git diff`, especially item tier costs after economy changes.
-4. Run `bun run dev` and spot-check a recent demo.
+1. Update `boon-deadlock` and `boon-proto` in `wasm/Cargo.toml`, then refresh
+   `wasm/Cargo.lock` with `cargo update --manifest-path wasm/Cargo.toml`.
+2. Install the matching catalog with `boon get <client-version>`.
+3. Run `bun run refresh`.
+4. Review `git diff`, especially item tier costs after economy changes.
+5. Run `bun run dev` and spot-check a recent demo.

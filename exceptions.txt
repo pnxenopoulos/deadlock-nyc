@@ -1,0 +1,6 @@
+---------------
+File: /mnt/c/Program Files (x86)/Steam/steamapps/common/Deadlock/game/citadel/pak01_000.vpk
+Exception: System.IO.InvalidDataException: File size (108479427) does not match size specified in file (63154) (Sound).
+   at ValveResourceFormat.Resource.Read(Stream input, Boolean verifyFileSize, Boolean leaveOpen) in /_/ValveResourceFormat/Resource/Resource.cs:line 346
+   at CLI.Decompiler.ProcessFile(String path, Stream stream, String originalPath, IFileLoader fileLoader) in /_/CLI/Decompiler.cs:line 632
+

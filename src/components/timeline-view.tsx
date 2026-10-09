@@ -15,25 +15,32 @@ import {
   TooltipTrigger,
 } from "@/components/ui/tooltip";
 import { cn } from "@/lib/utils";
-import type { MatchSummary, SnapshotStat } from "@/wasm/boon";
+import type { DamageSourceSeries, MatchSummary, SnapshotStat } from "@/wasm/boon";
+import { healingSourceLabel } from "@/lib/timeline-sources";
+import { percentageOfTotal, teamContributions } from "@/lib/timeline-contributions";
 
 type Mode = "team" | "player";
-type LineMetricKey = "net_worth" | "player_damage" | "player_healing";
+type LineMetricKey = "net_worth" | "player_damage" | "player_healing" | "self_healing" | "teammate_healing" | "player_damage_taken" | "creep_damage" | "neutral_damage" | "boss_damage" | "damage_absorbed" | "damage_mitigated" | "heal_prevented" | "heal_lost";
 
 // Per-snapshot scalar metrics — comparable across players, so they sum to a
 // team total (Team mode) or stand alone for one hero (Player mode).
 const LINE_METRICS: {
   key: LineMetricKey;
   label: string;
-  value: (s: SnapshotStat) => number;
+  value: (s: SnapshotStat) => number | null | undefined;
 }[] = [
   { key: "net_worth", label: "Souls", value: (s) => s.net_worth },
   { key: "player_damage", label: "Damage", value: (s) => s.player_damage },
-  { key: "player_healing", label: "Healing", value: (s) => s.player_healing },
+  ...([
+    ["player_healing", "Healing"], ["self_healing", "Self healing"], ["teammate_healing", "Teammate healing"],
+    ["player_damage_taken", "Damage taken"], ["creep_damage", "Lane creep damage"], ["neutral_damage", "Neutral damage"],
+    ["boss_damage", "Objective damage"], ["damage_absorbed", "Barrier absorption"], ["damage_mitigated", "Damage mitigated"],
+    ["heal_prevented", "Healing prevented"], ["heal_lost", "Healing lost"],
+  ] as const).map(([key, label]) => ({ key, label, value: (s: SnapshotStat) => s[key] })),
 ];
 
 // Souls-by-source bands (Player mode), stacked bottom → top.
-const SOUL_SOURCES: { key: keyof SnapshotStat; label: string; color: string }[] = [
+const SOUL_SOURCES: { key: Extract<keyof SnapshotStat, `souls_${string}`>; label: string; color: string }[] = [
   { key: "souls_lane", label: "Lane creeps", color: "#60a5fa" },
   { key: "souls_neutral", label: "Neutrals", color: "#34d399" },
   { key: "souls_players", label: "Players", color: "#f87171" },
@@ -69,6 +76,8 @@ function damageBand(source: string, idx: number): { label: string; color: string
 const BREAKDOWN_METRICS: { key: string; label: string }[] = [
   { key: "souls_source", label: "Soul Breakdown" },
   { key: "damage_source", label: "Damage by Source" },
+  { key: "healing_source", label: "Healing by source" },
+  { key: "regen_source", label: "Regeneration by source" },
 ];
 const isBreakdown = (key: string) =>
   BREAKDOWN_METRICS.some((m) => m.key === key);
@@ -106,7 +115,39 @@ type StackedPoint = { t: number; segs: { y0: number; y1: number }[]; total: numb
 // One stacked-area band (a soul source or a damage category).
 type StackBand = { key: string; label: string; color: string };
 // One row in the hover readout. `heroId` (line series) drives the portrait swatch.
-type HoverRow = { label: string; color: string; v: number; heroId?: number };
+type HoverRow = {
+  label: string; color: string; v: number; heroId?: number; name?: string;
+  percentage?: string; children?: HoverRow[];
+};
+
+export function TimelineReadout({ rows }: { rows: HoverRow[] }) {
+  return (
+    <div className="flex flex-col gap-0.5">
+      {rows.map((row, index) => {
+        const portrait = row.heroId != null ? heroPortraitUrl(row.heroId) : null;
+        return (
+          <React.Fragment key={`${row.heroId ?? row.label}:${index}`}>
+            <div className="flex items-center justify-between gap-2" title={row.name ? `${row.label} · ${row.name}` : row.label}>
+              <span className="flex min-w-0 items-center gap-1">
+                {portrait ? (
+                  <img src={portrait} alt="" className="size-4 flex-shrink-0 rounded-full object-cover" style={{ boxShadow: `0 0 0 1.5px ${row.color}` }} />
+                ) : (
+                  <span className="size-2 flex-shrink-0 rounded-full" style={{ backgroundColor: row.color }} />
+                )}
+                <span className="truncate">{row.label}</span>
+              </span>
+              <span className="flex-shrink-0 tabular-nums">
+                {compactNumber(row.v)}
+                {row.percentage != null && <span className="text-muted-foreground"> ({row.percentage})</span>}
+              </span>
+            </div>
+            {row.children && <div className="pl-4"><TimelineReadout rows={row.children} /></div>}
+          </React.Fragment>
+        );
+      })}
+    </div>
+  );
+}
 type Chart =
   | { kind: "lines"; series: LineSeries[]; marker: "portrait" | "dot"; times: number[] }
   | {
@@ -173,18 +214,24 @@ export function TimelineView({
         LINE_METRICS.find((x) => x.key === metricKey) ?? LINE_METRICS[0];
       const series: LineSeries[] = teams.map((team) => {
         const sums = new Map<number, number>();
+        const counts = new Map<number, number>();
         for (const s of snapshots) {
           if (teamByHero.get(s.hero_id) !== team) continue;
-          sums.set(s.time_s, (sums.get(s.time_s) ?? 0) + m.value(s));
+          const value = m.value(s);
+          if (value == null) continue;
+          sums.set(s.time_s, (sums.get(s.time_s) ?? 0) + value);
+          counts.set(s.time_s, (counts.get(s.time_s) ?? 0) + 1);
         }
         return {
           label: TEAM_NAMES[team] ?? `Team ${team}`,
           color: TEAM_COLORS[team] ?? "#888",
           team,
-          points: snapTimes.map((t) => ({ t, v: sums.get(t) ?? 0 })),
+          points: snapTimes.filter((t) => counts.get(t) === players.filter((p) => p.team === team).length)
+            .map((t) => ({ t, v: sums.get(t)! })),
         };
       });
-      return { kind: "lines", series, marker: "dot", times: snapTimes };
+      return series.some((s) => s.points.length) ? { kind: "lines", series, marker: "dot", times: snapTimes }
+        : { kind: "noHero", message: "This stat was not recorded." };
     }
     const heroes = players.filter((p) => selected.has(p.hero_id));
     if (heroes.length === 0) return { kind: "noHero" };
@@ -218,19 +265,25 @@ export function TimelineView({
       };
     }
 
-    if (metricKey === "damage_source") {
+    const sourceMetrics: Record<string, DamageSourceSeries[]> = {
+      damage_source: summary.damage_by_source, healing_source: summary.healing_by_source,
+      regen_source: summary.regen_by_source,
+    };
+    if (metricKey in sourceMetrics) {
       const hero = heroes[0];
       const times = summary.damage_sample_times;
       // The dealer hero's per-category cumulative series; biggest contributor
       // at the bottom of the stack.
-      const heroSeries = summary.damage_by_source
+      const heroSeries = sourceMetrics[metricKey]
         .filter((d) => d.hero_id === hero.hero_id)
         .sort((a, b) => (b.values.at(-1) ?? 0) - (a.values.at(-1) ?? 0));
       if (heroSeries.length === 0 || times.length === 0)
-        return { kind: "noHero", message: "No damage breakdown for this hero." };
+        return { kind: "noHero", message: "No recorded source breakdown for this hero." };
       const bands: StackBand[] = heroSeries.map((d, i) => ({
         key: d.source,
-        ...damageBand(d.source, i),
+        ...(metricKey === "damage_source" ? damageBand(d.source, i) : {
+          label: healingSourceLabel(d.source), color: DAMAGE_FALLBACK_COLORS[i % DAMAGE_FALLBACK_COLORS.length],
+        }),
       }));
       const stacked: StackedPoint[] = times.map((t, i) => {
         let acc = 0;
@@ -258,9 +311,10 @@ export function TimelineView({
       color: TEAM_COLORS[p.team] ?? "#888",
       team: p.team,
       heroId: p.hero_id,
-      points: snapsFor(p.hero_id).map((s) => ({ t: s.time_s, v: m.value(s) })),
+      points: snapsFor(p.hero_id).flatMap((s) => m.value(s) == null ? [] : [{ t: s.time_s, v: m.value(s)! }]),
     }));
-    return { kind: "lines", series, marker: "portrait", times: snapTimes };
+    return series.some((s) => s.points.length) ? { kind: "lines", series, marker: "portrait", times: snapTimes }
+      : { kind: "noHero", message: "This stat was not recorded for the selected players." };
   }, [hasData, mode, metricKey, selected, snapshots, snapTimes, players, teamByHero, teams, summary]);
 
   // The active chart's x-domain. Line metrics + souls live on the snapshot
@@ -407,16 +461,17 @@ export function TimelineView({
   };
 
   // Hover readout: per-series (lines) or per-source (stacked) value at hoverT.
-  const hoverRows = React.useMemo(() => {
+  const hoverRows = React.useMemo<HoverRow[]>(() => {
     if (hoverT == null || !chart) return [];
     if (chart.kind === "lines") {
       return chart.series
         .map((s) => {
-          if (s.points.length === 0) return null;
-          let best = s.points[0];
-          for (const p of s.points)
-            if (Math.abs(p.t - hoverT) < Math.abs(best.t - hoverT)) best = p;
-          return { label: s.label, color: s.color, v: best.v, heroId: s.heroId };
+          const point = s.points.find((point) => point.t === hoverT);
+          if (!point) return null;
+          const metric = LINE_METRICS.find((metric) => metric.key === metricKey) ?? LINE_METRICS[0];
+          const children = mode === "team" ? teamContributions(players, snapshots, hoverT, s.team, metric.key, point.v)
+            .map((row) => ({ ...row, color: s.color })) : undefined;
+          return { label: s.label, color: s.color, v: point.v, heroId: s.heroId, children };
         })
         .filter((r): r is NonNullable<typeof r> => r != null)
         .sort((a, b) => b.v - a.v);
@@ -430,11 +485,12 @@ export function TimelineView({
           label: band.label,
           color: band.color,
           v: best.segs[i].y1 - best.segs[i].y0,
+          percentage: percentageOfTotal(best.segs[i].y1 - best.segs[i].y0, best.total),
         }))
-        .sort((a, b) => b.v - a.v) as HoverRow[];
+        .sort((a, b) => b.v - a.v);
     }
     return [];
-  }, [hoverT, chart]);
+  }, [hoverT, chart, mode, metricKey, players, snapshots]);
 
   return (
     <div className="flex h-full min-h-0 w-full min-w-0 flex-col gap-3">
@@ -461,51 +517,31 @@ export function TimelineView({
           </TabsList>
         </Tabs>
 
-        <Tabs
-          value={metricKey}
-          onValueChange={(v) => {
-            setMetricKey(v);
-            // The breakdowns are single-player compositions: collapse a
-            // multi-selection down to the first selected hero.
-            if (isBreakdown(v))
-              setSelected((prev) => {
-                if (prev.size <= 1) return prev;
-                const first = players.find((p) => prev.has(p.hero_id));
+        <label className="flex items-center gap-2 text-xs text-muted-foreground">
+          Metric
+          <select
+            aria-label="Timeline metric"
+            value={metricKey}
+            className="max-w-56 rounded border border-border bg-background px-2 py-1 text-foreground"
+            onChange={(event) => {
+              const value = event.target.value;
+              setMetricKey(value);
+              if (isBreakdown(value)) setSelected((prev) => {
+                const first = players.find((player) => prev.has(player.hero_id));
                 return new Set(first ? [first.hero_id] : []);
               });
-          }}
-        >
-          <TabsList className="h-7">
-            {LINE_METRICS.map((m) => (
-              <TabsTrigger key={m.key} value={m.key} className="px-2 text-xs">
-                {m.label}
-              </TabsTrigger>
-            ))}
-            {BREAKDOWN_METRICS.map((m) =>
-              mode === "player" ? (
-                <TabsTrigger key={m.key} value={m.key} className="px-2 text-xs">
-                  {m.label}
-                </TabsTrigger>
-              ) : (
-                // Always shown, but a single-player view — disabled in Team mode.
-                <Tooltip key={m.key}>
-                  <TooltipTrigger asChild>
-                    <span tabIndex={0} className="inline-flex">
-                      <TabsTrigger
-                        value={m.key}
-                        disabled
-                        className="px-2 text-xs"
-                      >
-                        {m.label}
-                      </TabsTrigger>
-                    </span>
-                  </TooltipTrigger>
-                  <TooltipContent>Must select a player view</TooltipContent>
-                </Tooltip>
-              ),
-            )}
-          </TabsList>
-        </Tabs>
+            }}
+          >
+            <optgroup label="Totals">
+              {LINE_METRICS.map((metric) => (
+                <option key={metric.key} value={metric.key} disabled={!snapshots.some((row) => metric.value(row) != null)}>{metric.label}</option>
+              ))}
+            </optgroup>
+            <optgroup label="Player breakdowns" disabled={mode !== "player"}>
+              {BREAKDOWN_METRICS.map((metric) => <option key={metric.key} value={metric.key}>{metric.label}</option>)}
+            </optgroup>
+          </select>
+        </label>
 
         {mode === "player" && (
           // All heroes on one line, grouped by team, each group capped by its
@@ -598,6 +634,11 @@ export function TimelineView({
       </div>
 
       {/* Chart. */}
+      <p className="text-[10px] text-muted-foreground">
+        Cumulative recorded totals.
+        {metricKey.startsWith("healing_") && " Healing provided; regeneration is separate."}
+        {metricKey.startsWith("regen_") && " Regeneration received (including troopers and fountain)."}
+      </p>
       <div
         ref={plotRef}
         onPointerMove={onMove}
@@ -668,8 +709,9 @@ export function TimelineView({
 
             {hoverT != null && hoverRows.length > 0 && (
               <div
-                className="pointer-events-none absolute top-2 z-10 w-40 rounded-md border border-border bg-background/90 p-1.5 text-[11px] shadow backdrop-blur"
-                style={{ left: Math.min(box.w - 164, Math.max(4, px(hoverT) + 8)) }}
+                className="absolute top-2 z-10 max-h-[calc(100%_-_1rem)] w-72 overflow-y-auto rounded-md border border-border bg-background/90 p-1.5 text-[11px] shadow backdrop-blur"
+                style={{ left: Math.max(4, Math.min(box.w - 292, px(hoverT) + 8)) }}
+                onPointerMove={(event) => event.stopPropagation()}
               >
                 {/* Stacked souls-by-source: name the hero (the legend is gone). */}
                 {chart?.kind === "stacked" &&
@@ -694,38 +736,7 @@ export function TimelineView({
                 <div className="mb-1 tabular-nums text-muted-foreground">
                   {clock(hoverT)}
                 </div>
-                <div className="flex flex-col gap-0.5">
-                  {hoverRows.map((r) => {
-                    const portrait =
-                      r.heroId != null ? heroPortraitUrl(r.heroId) : null;
-                    return (
-                      <div
-                        key={r.label}
-                        className="flex items-center justify-between gap-2"
-                      >
-                        <span className="flex min-w-0 items-center gap-1">
-                          {portrait ? (
-                            <img
-                              src={portrait}
-                              alt=""
-                              className="size-4 flex-shrink-0 rounded-full object-cover"
-                              style={{ boxShadow: `0 0 0 1.5px ${r.color}` }}
-                            />
-                          ) : (
-                            <span
-                              className="size-2 flex-shrink-0 rounded-full"
-                              style={{ backgroundColor: r.color }}
-                            />
-                          )}
-                          <span className="truncate">{r.label}</span>
-                        </span>
-                        <span className="flex-shrink-0 tabular-nums">
-                          {compactNumber(r.v)}
-                        </span>
-                      </div>
-                    );
-                  })}
-                </div>
+                <TimelineReadout rows={hoverRows} />
               </div>
             )}
           </>

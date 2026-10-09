@@ -1,6 +1,6 @@
 // Build a compact internal-id -> in-game English ability name manifest.
 //
-// Inputs are copied into scripts/.vdata by sync-game-data.sh. Restricting the
+// Inputs come from the installed-game cache or sync-game-data.sh. Restricting the
 // output to top-level abilities.vdata entries avoids shipping the full Valve
 // localization catalog in the browser bundle.
 
@@ -9,9 +9,12 @@ import { resolve } from "node:path";
 import { topLevelEntries } from "./lib/kv3";
 
 const ROOT = resolve(import.meta.dir, "..");
+const installedDirectory = resolve(ROOT, "scripts/.vdata/installed-game/scripts");
 const VDATA_DIR = process.env.VDATA_DIR
   ? resolve(process.env.VDATA_DIR)
-  : resolve(import.meta.dir, ".vdata");
+  : existsSync(resolve(installedDirectory, "citadel_heroes_english.txt"))
+    ? installedDirectory
+    : resolve(import.meta.dir, ".vdata");
 const OUTPUT = resolve(ROOT, "src/data/ability-names.json");
 const ABILITIES = resolve(VDATA_DIR, "abilities.vdata");
 const LOCALIZATION = [
