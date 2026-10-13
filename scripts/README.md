@@ -148,7 +148,7 @@ badge: `rank06_lg_psd.vtex_c` becomes `public/ranks/06.webp`, and packed ranks
 
 ## Tier 3 — Boon parser catalogs
 
-Boon 0.15 resolves demo IDs and calculates current hero/ability stats, imbues,
+Boon 0.16 resolves demo IDs and calculates current hero/ability stats, imbues,
 and player states from versioned `boon-data` JSON catalogs. The browser cannot
 read Boon's normal filesystem cache, so deadlock.nyc generates its compact
 name lookup and copies the matching catalogs into `public/boon-data/` for the
@@ -156,9 +156,9 @@ replay worker. Replay modifiers need the same catalog
 lifetime rules as stat queries:
 
 ```bash
-boon get 6759       # only needed when that version is not already installed
+boon get 6759       # current bundled snapshot; only needed if not installed
 boon get 6746       # matching snapshot for the regression demo
-bun run catalog     # writes metadata, name lookup, and browser catalogs
+BOON_CLIENT_VERSION=6759 bun run catalog  # keep the bundled snapshot
 bun run wasm
 ```
 

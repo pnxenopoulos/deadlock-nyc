@@ -49,12 +49,12 @@ and renders the parsed entities, events, and stats in the browser.
 - [React 19](https://react.dev/) + [TypeScript](https://www.typescriptlang.org/)
 - [Vite 6](https://vite.dev/) + [Tailwind CSS 4](https://tailwindcss.com/)
 - [Bun](https://bun.sh/) (package manager + script runner)
-- [boon](https://github.com/pnxenopoulos/boon) 0.15 (Rust), published on crates.io and compiled to
+- [boon](https://github.com/pnxenopoulos/boon) 0.16 (Rust), published on crates.io and compiled to
   WebAssembly with [`wasm-pack`](https://github.com/rustwasm/wasm-pack)
 
 ## Performance and memory
 
-The WASM adapter uses Boon 0.15 and pbdems2 0.3.6. It requests only the event
+The WASM adapter uses Boon 0.16 and pbdems2 0.4.0. It requests only the event
 types used by the UI and uses boon's changed-entity indices for roster and
 objective updates instead of rescanning every live entity each tick.
 
@@ -68,6 +68,10 @@ columns directly.
 Player-detail queries use Boon's catalog-byte loaders and single-pass stat
 batches. The viewer uses Boon's Deadlock coordinate helpers directly; no
 vendored parser or coordinate-origin detection is needed.
+
+Ability history tracks full entity and owner handles, ability IDs, and slots,
+so identity changes are recorded even when cooldowns are unchanged. Field keys
+are resolved from each demo's serializers, not persisted across parser upgrades.
 
 Replay modifiers and Urn carriers use Boon's shared catalog lifetime rules,
 ordered updates, and full-handle validation. No six-player suppression, guessed
@@ -101,7 +105,7 @@ or its Cargo dependencies change).
 
 ### Stat-query performance checks
 
-Normal builds use Boon 0.15's published checkpoint API. Demo loading prepares
+Normal builds use Boon's published checkpoint API. Demo loading prepares
 up to 16 exact replay checkpoints once; repeated stat queries resume from the
 nearest earlier checkpoint. Recorded statuses are indexed once and update
 immediately. Superseded stat requests are coalesced, and recent results are cached.

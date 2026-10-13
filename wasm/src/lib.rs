@@ -839,8 +839,8 @@ impl DemoParser {
         let mut modifier_spans: Vec<ModifierSpan> = Vec::new();
 
         // --- Ability cooldowns (per-ability entity state) -----------------
-        // Each ability entity carries cooldown/charge fields; we diff them every
-        // tick and emit a row only when they change (change-only, like the
+        // Each ability entity carries identity and cooldown/charge fields; we
+        // emit a row only when they change (change-only, like the
         // modifier table). Field keys differ per ability class, so they are
         // resolved once per class and cached. Owner ehandle → pawn → hero.
         struct AbilityKeys {
@@ -854,9 +854,7 @@ impl DemoParser {
             owner: Option<u64>,
         }
         let mut ability_keys_cache: HashMap<String, AbilityKeys> = HashMap::new();
-        // entity idx → last (cooldown_start, cooldown_end, remaining_charges,
-        // recharge_start, recharge_end), for change detection.
-        let mut abil_prev: HashMap<boon::EntityId, (f32, f32, i32, f32, f32)> = HashMap::new();
+        let mut abil_prev: HashMap<boon::EntityId, AbilityState> = HashMap::new();
         let mut ability_ticks: Vec<AbilityTick> = Vec::new();
 
         use boon_proto::proto::{CitadelUserMessageIds as Msg, ECitadelGameEvents};
@@ -1598,9 +1596,14 @@ impl DemoParser {
                 }
                 // --- Ability cooldown / charge state (change-only) ---------
                 // Walk only the ability entities that changed this tick; emit a
-                // row when an ability's cooldown/charge fields differ from last
+                // row when identity or cooldown/charge fields differ from last
                 // seen. Mirrors boon-python's `ability_ticks`. Runs every tick
                 // (not the sampled cadence) so a cast's exact tick is captured.
+                for change in ctx.entities().entity_changes() {
+                    if change.kind == boon::EntityChangeKind::Deleted {
+                        abil_prev.remove(&change.id());
+                    }
+                }
                 for &idx in ctx.entities().updated_indices() {
                     let Some(entity) = ctx.entities().get(idx) else {
                         continue;
@@ -1629,21 +1632,28 @@ impl DemoParser {
                     if keys.cooldown_end.is_none() || keys.remaining_charges.is_none() {
                         continue;
                     }
-                    let hero_id = entity
-                        .get_handle(keys.owner)
-                        .and_then(|handle| pawn_index(ctx.entities(), Some(handle)))
-                        .and_then(|owner_idx| pawn_to_hero.get(&owner_idx).copied())
-                        .unwrap_or(0);
+                    let Some(owner) = entity.get_handle(keys.owner) else {
+                        continue;
+                    };
+                    let hero_id = ctx
+                        .entities()
+                        .get_by_handle(owner)
+                        .filter(|pawn| pawn.class_name.as_ref() == PAWN_CLASS)
+                        .map_or(0, |pawn| pawn.get_i64(pk_hero));
                     if hero_id == 0 {
                         continue;
                     }
-                    let state = (
-                        get_f32(entity, keys.cooldown_start),
-                        get_f32(entity, keys.cooldown_end),
-                        get_i64(entity, keys.remaining_charges) as i32,
-                        get_f32(entity, keys.recharge_start),
-                        get_f32(entity, keys.recharge_end),
-                    );
+                    let state = AbilityState {
+                        owner,
+                        hero_id,
+                        ability_id: entity.get_u32(keys.subclass_id),
+                        slot: get_i64(entity, keys.slot) as i32,
+                        cooldown_start: get_f32(entity, keys.cooldown_start),
+                        cooldown_end: get_f32(entity, keys.cooldown_end),
+                        remaining_charges: get_i64(entity, keys.remaining_charges) as i32,
+                        recharge_start: get_f32(entity, keys.recharge_start),
+                        recharge_end: get_f32(entity, keys.recharge_end),
+                    };
                     let changed = abil_prev
                         .get(&entity.id())
                         .map(|p| *p != state)
@@ -1651,14 +1661,14 @@ impl DemoParser {
                     if changed {
                         ability_ticks.push(AbilityTick {
                             tick: ctx.tick(),
-                            hero_id,
-                            ability_id: get_i64(entity, keys.subclass_id) as u32,
-                            slot: get_i64(entity, keys.slot) as i32,
-                            cooldown_start: state.0,
-                            cooldown_end: state.1,
-                            remaining_charges: state.2,
-                            charge_recharge_start: state.3,
-                            charge_recharge_end: state.4,
+                            hero_id: state.hero_id,
+                            ability_id: state.ability_id,
+                            slot: state.slot,
+                            cooldown_start: state.cooldown_start,
+                            cooldown_end: state.cooldown_end,
+                            remaining_charges: state.remaining_charges,
+                            charge_recharge_start: state.recharge_start,
+                            charge_recharge_end: state.recharge_end,
                         });
                         abil_prev.insert(entity.id(), state);
                     }
@@ -2365,8 +2375,21 @@ struct AbilityEvent {
     ability_name: String,
 }
 
-/// A change in one ability's cooldown/charge state. `cooldown_start`/`_end` are
-/// game-time seconds (the cooldown is active until game time reaches
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct AbilityState {
+    owner: u32,
+    hero_id: i64,
+    ability_id: u32,
+    slot: i32,
+    cooldown_start: f32,
+    cooldown_end: f32,
+    remaining_charges: i32,
+    recharge_start: f32,
+    recharge_end: f32,
+}
+
+/// A change in one ability's identity or cooldown/charge state.
+/// `cooldown_start`/`_end` are game-time seconds (active until game time reaches
 /// `cooldown_end`). Emitted only on change, per ability entity, tick-ordered.
 #[derive(Serialize)]
 struct AbilityTick {
@@ -2968,6 +2991,39 @@ mod tests {
         AbilitySlot, MapEntityKeys, OpenModifier, PAWN_CLASS, TROOPER_CLASS, is_live_npc,
         pawn_index, should_replace_ability_slots,
     };
+
+    #[test]
+    fn ability_identity_changes_emit_even_with_unchanged_cooldowns() {
+        let state = super::AbilityState {
+            owner: (7 << 14) | 2,
+            hero_id: 63,
+            ability_id: 123,
+            slot: 0,
+            cooldown_start: 0.0,
+            cooldown_end: 0.0,
+            remaining_charges: 1,
+            recharge_start: 0.0,
+            recharge_end: 0.0,
+        };
+        assert_eq!(state, state);
+        for changed in [
+            super::AbilityState {
+                owner: (8 << 14) | 2,
+                ..state
+            },
+            super::AbilityState {
+                hero_id: 15,
+                ..state
+            },
+            super::AbilityState {
+                ability_id: 456,
+                ..state
+            },
+            super::AbilityState { slot: 1, ..state },
+        ] {
+            assert_ne!(state, changed);
+        }
+    }
 
     #[test]
     fn patron_phase_one_kill_is_not_final_destruction() {
