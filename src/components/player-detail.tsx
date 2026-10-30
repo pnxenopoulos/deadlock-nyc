@@ -1,3 +1,5 @@
+import { FeatureRequired } from "./replay-options";
+import { activeCooldown, chargeAt, type AbilityCooldown } from "@/lib/ability-state";
 import * as React from "react";
 import { ChevronDown, ChevronLeft, Loader2, Shield } from "lucide-react";
 
@@ -128,80 +130,9 @@ const ABILITY_PIXELS = 48;
 const ABILITY_TIERS = 3;
 const TICKS_PER_SECOND = 64;
 
-/** One reconstructed cooldown period for an ability, in absolute ticks. */
-export type CooldownSpan = {
-  /** Tick the cooldown started (the cast). */
-  start: number;
-  /** Tick the ability becomes available again. */
-  end: number;
-  /** Total cooldown length in seconds (the ring's full sweep). */
-  total: number;
-};
-
-/** Charge count over time for a charge-based ability (valid from `startTick`). */
-export type ChargeState = {
-  startTick: number;
-  /** Available charges at this point. */
-  count: number;
-  /** Tick the regenerating charge began filling (anchor for its bar). */
-  rechargeStart: number;
-  /** Tick the regenerating charge completes. */
-  rechargeEnd: number;
-  recharging: boolean;
-};
-
-/** Reconstructed cooldown + charge timeline for one ability. */
-export type AbilityCooldown = {
-  /** Max charges seen; ≥ 2 marks a charge-based ability (show pills, no ring). */
-  maxCharges: number;
-  cooldowns: CooldownSpan[];
-  charges: ChargeState[];
-};
-
-// The cooldown active at `tick`, or null if the ability is ready. Spans are
-// tick-ordered and non-overlapping, so the latest one starting at or before
-// `tick` is the only candidate.
-function activeCooldown(
-  spans: CooldownSpan[] | undefined,
-  tick: number,
-): { remaining: number; total: number } | null {
-  if (!spans) return null;
-  for (let i = spans.length - 1; i >= 0; i--) {
-    if (spans[i].start <= tick) {
-      return tick < spans[i].end
-        ? {
-            remaining: (spans[i].end - tick) / TICKS_PER_SECOND,
-            total: spans[i].total,
-          }
-        : null;
-    }
-  }
-  return null;
-}
-
-// Charge count + recharge progress (0..1 for the regenerating charge) at `tick`.
-function chargeAt(
-  states: ChargeState[],
-  tick: number,
-  maxCharges: number,
-): { count: number; recharging: boolean; progress: number } | null {
-  for (let i = states.length - 1; i >= 0; i--) {
-    const s = states[i];
-    if (s.startTick <= tick) {
-      const recharging =
-        s.recharging && s.count < maxCharges && tick < s.rechargeEnd;
-      const span = s.rechargeEnd - s.rechargeStart;
-      const progress =
-        recharging && span > 0
-          ? Math.min(1, Math.max(0, (tick - s.rechargeStart) / span))
-          : 0;
-      return { count: s.count, recharging, progress };
-    }
-  }
-  return null;
-}
-
 export function PlayerDetail({
+  modifiersEnabled = true,
+  onEnableModifiers,
   player,
   stats,
   items,
@@ -220,6 +151,8 @@ export function PlayerDetail({
   regTick,
   onBack,
 }: {
+  modifiersEnabled?: boolean;
+  onEnableModifiers?: () => void;
   player: PlayerInfo;
   stats: PlayerPosition | undefined;
   items: HeroItems | undefined;
@@ -249,13 +182,13 @@ export function PlayerDetail({
   );
   const imbuesByAbility = React.useMemo(() => {
     const byAbility = new Map<number, PlayerDetails["imbues"]["bindings"]>();
-    for (const binding of details?.imbues.bindings ?? []) {
+    for (const binding of modifiersEnabled ? details?.imbues.bindings ?? [] : []) {
       const list = byAbility.get(binding.ability_id) ?? [];
       list.push(binding);
       byAbility.set(binding.ability_id, list);
     }
     return byAbility;
-  }, [details]);
+  }, [details, modifiersEnabled]);
 
   // Pad to a fixed 10-slot inventory so empty slots stay visible.
   const slots = (items?.items ?? []).slice(0, SLOT_COUNT);
@@ -341,17 +274,18 @@ export function PlayerDetail({
 
         {abilities && abilities.length > 0 && (
           <CollapsibleSection title="Abilities">
+            {!modifiersEnabled && <p className="mb-2 text-[10px] text-muted-foreground">Enable statuses/modifiers and reparse to view ability imbues. Recorded cooldowns remain available.</p>}
             <div className="flex gap-2">
               {abilities.map((a) => {
                 const ac = abilityCooldowns?.get(a.ability_id);
                 const isCharge = (ac?.maxCharges ?? 0) >= 2;
                 const charge = isCharge
-                  ? chargeAt(ac!.charges, tick ?? 0, ac!.maxCharges)
+                  ? chargeAt(ac!.charges, regTick ?? tick ?? 0, ac!.maxCharges)
                   : null;
                 // The ring shows the per-cast cooldown for all abilities —
                 // including charge abilities (the between-cast lockout), where
                 // it sits alongside the charge pills.
-                const cd = activeCooldown(ac?.cooldowns, tick ?? 0);
+                const cd = activeCooldown(ac?.cooldowns, regTick ?? tick ?? 0);
                 const imbues = imbuesByAbility.get(a.ability_id) ?? [];
                 return (
                   <div
@@ -448,22 +382,22 @@ export function PlayerDetail({
           </CollapsibleSection>
         )}
 
-        {visibleModifiers && (
+        {(visibleModifiers || !modifiersEnabled) && (
           <CollapsibleSection
             title="Modifiers"
             right={
               <span className="text-xs font-medium tabular-nums text-muted-foreground">
-                {visibleModifiers.length || ""}
+                {visibleModifiers?.length || ""}
               </span>
             }
           >
-            <ModifierList
-              modifiers={visibleModifiers}
+            {!modifiersEnabled ? <FeatureRequired feature="Statuses/modifiers" onEnable={onEnableModifiers} /> : <ModifierList
+              modifiers={visibleModifiers ?? []}
               selfTeam={player.team}
               selfHeroId={player.hero_id}
               players={players}
               regTick={regTick ?? 0}
-            />
+            />}
           </CollapsibleSection>
         )}
 
@@ -532,7 +466,7 @@ export function PlayerDetail({
             ) : undefined
           }
         >
-          <StatusList status={status} />
+          {modifiersEnabled ? <StatusList status={status} /> : <FeatureRequired feature="Statuses/modifiers" onEnable={onEnableModifiers} />}
         </CollapsibleSection>
 
         <CollapsibleSection title="Permanent buffs">
@@ -543,12 +477,12 @@ export function PlayerDetail({
           {catalog?.demoVersion && catalog.demoVersion !== catalog.version && (
             <p className="mb-2 text-[10px] text-amber-500">Demo build {catalog.demoVersion} uses catalog {catalog.version}; calculated stats may differ.</p>
           )}
-          <HeroStats
+          {!modifiersEnabled ? <FeatureRequired feature="Statuses/modifiers" onEnable={onEnableModifiers} /> : <HeroStats
             details={details}
             abilities={abilities}
             loading={detailsLoading}
             error={detailsError}
-          />
+          />}
         </CollapsibleSection>
       </div>
     </div>

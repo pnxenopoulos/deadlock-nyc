@@ -51,7 +51,9 @@ jobs:
       # Custom domain (deadlock.nyc) serves from the root, so Vite's default
       # base of "/" is correct — no override needed. public/CNAME is copied into
       # dist/ and tells Pages the domain on every deploy.
-      - name: Build site
+      - name: Build site with the latest verified win probability release
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
         run: bun run build
 
       - name: Upload Pages artifact

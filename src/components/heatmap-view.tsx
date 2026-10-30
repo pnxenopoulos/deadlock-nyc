@@ -1,3 +1,4 @@
+import { FeatureRequired } from "./replay-options";
 import * as React from "react";
 import { Crosshair, MapPin, Maximize, Skull, ZoomIn, ZoomOut } from "lucide-react";
 
@@ -202,6 +203,8 @@ export function HeatmapView({
   objectives,
   objectiveEvents,
   statuses,
+  modifiersEnabled = true,
+  onEnableModifiers,
   pauseIntervals,
 }: {
   players: PlayerInfo[];
@@ -211,6 +214,8 @@ export function HeatmapView({
   objectives: ObjectiveInfo[];
   objectiveEvents: ObjectiveEvent[];
   statuses: StatusStore;
+  modifiersEnabled?: boolean;
+  onEnableModifiers?: () => void;
   pauseIntervals: PauseInterval[];
 }) {
   const [selected, setSelected] = React.useState<Set<number>>(
@@ -541,15 +546,15 @@ export function HeatmapView({
 
   const combatByHero = React.useMemo(() => new Map(players.map((player) => [
     player.hero_id,
-    statuses.percentageInWindow(player.steam_id, "IN_COMBAT", range[0], range[1]),
-  ])), [statuses, players, range]);
+    modifiersEnabled ? statuses.percentageInWindow(player.steam_id, "IN_COMBAT", range[0], range[1]) : null,
+  ])), [statuses, players, range, modifiersEnabled]);
 
-  const outnumbered = React.useMemo(() => new OutnumberedCombat(
+  const outnumbered = React.useMemo(() => modifiersEnabled ? new OutnumberedCombat(
     frames, players, statuses, pauseIntervals,
-  ), [frames, players, statuses, pauseIntervals]);
+  ) : null, [frames, players, statuses, pauseIntervals, modifiersEnabled]);
   const outnumberedByHero = React.useMemo(() => new Map(players.map((player) => [
     player.hero_id,
-    outnumbered.secondsInWindow(player.hero_id, range[0], range[1]),
+    outnumbered?.secondsInWindow(player.hero_id, range[0], range[1]),
   ])), [outnumbered, players, range]);
 
   // Vertical event bars for the timeline brush: kills (victim-team colored) and
@@ -617,6 +622,7 @@ export function HeatmapView({
 
   return (
     <div className="flex h-full min-h-0 w-full min-w-0 flex-col gap-3">
+      {!modifiersEnabled && <div><p className="mb-1 text-xs text-muted-foreground">Combat time and outnumbered combat need recorded statuses.</p><FeatureRequired feature="Statuses/modifiers" onEnable={onEnableModifiers} /></div>}
       {/* Top: left stats · center map · right controls. The rails grow to fill
           the width up to the page edges; the center stays a height-bound square. */}
       <div className="flex min-h-0 flex-1 items-stretch gap-3">

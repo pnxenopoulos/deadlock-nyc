@@ -25,7 +25,12 @@ export function InfoDialog({
       >
         <div className="flex items-start justify-between gap-4">
           <h2 className="text-lg font-medium">About deadlock.nyc</h2>
-          <Button variant="ghost" size="icon" onClick={onClose} aria-label="Close">
+          <Button
+            variant="ghost"
+            size="icon"
+            onClick={onClose}
+            aria-label="Close"
+          >
             <X />
           </Button>
         </div>
@@ -41,6 +46,24 @@ export function InfoDialog({
               Boon v{__BOON_VERSION__}
             </a>{" "}
             parser compiled to WebAssembly.
+          </p>
+          <p>
+            Win probability is powered by{" "}
+            <a
+              href="https://github.com/pnxenopoulos/deadlock-win-prob"
+              target="_blank"
+              rel="noreferrer"
+              className="text-primary underline-offset-4 hover:underline"
+            >
+              Deadlock Win Probability
+            </a>
+            .
+            <span className="mt-1 block text-xs">
+              Model:{" "}
+              <span className="break-all font-mono text-foreground">
+                {__WIN_PROBABILITY_MODEL_VERSION__}
+              </span>
+            </span>
           </p>
           <p>Your demo files never leave your machine.</p>
           <p className="border-t border-border pt-3 text-xs">

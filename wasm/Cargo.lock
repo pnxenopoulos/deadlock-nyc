@@ -43,9 +43,9 @@ dependencies = [
 
 [[package]]
 name = "boon-deadlock"
-version = "0.16.0"
+version = "0.19.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1f602b246ace7000fa159321683968e0e20b2a942ad08546e9e806474cad92b7"
+checksum = "f0858ee3287d42f6f2a0631cfe864bcc67e907ca3d7a79066829fa167e023b06"
 dependencies = [
  "boon-proto",
  "memmap2",
@@ -613,9 +613,9 @@ checksum = "9f7c3e4beb33f85d45ae3e3a1792185706c8e16d043238c593331cc7cd313b50"
 
 [[package]]
 name = "pbdems2"
-version = "0.4.0"
+version = "0.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "41f9fe55ed083d4ed567263cc4d59eca0b475c23df32b256d1844a2618471fc2"
+checksum = "83cefe6c2eca3cb48b386ddbf538a861d4e9cbfae6c6a89373f93ba2b854dbe0"
 dependencies = [
  "rustc-hash",
  "serde",

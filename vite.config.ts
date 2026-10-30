@@ -17,6 +17,18 @@ if (!boonVersion) {
   throw new Error("boon-deadlock version not found in wasm/Cargo.lock");
 }
 
+const modelVersion = JSON.parse(
+  readFileSync(
+    path.resolve(__dirname, "public/models/win-probability/manifest.json"),
+    "utf8",
+  ),
+).model_version;
+if (typeof modelVersion !== "string" || !modelVersion) {
+  throw new Error(
+    "Win probability model version not found in bundled manifest",
+  );
+}
+
 export default defineConfig({
   // Relative asset paths so the build works both at the GitHub Pages project
   // URL (username.github.io/deadlock-nyc/) and at the apex custom domain
@@ -30,6 +42,7 @@ export default defineConfig({
   plugins: [react(), tailwindcss()],
   define: {
     __BOON_VERSION__: JSON.stringify(boonVersion),
+    __WIN_PROBABILITY_MODEL_VERSION__: JSON.stringify(modelVersion),
   },
   resolve: {
     alias: {

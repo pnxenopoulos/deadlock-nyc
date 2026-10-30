@@ -1,3 +1,5 @@
+import { ReplayOptionsFields, ReplayOptionsDialog } from "@/components/replay-options";
+import { DEFAULT_LOAD_OPTIONS, type ReplayLoadOptions } from "@/wasm/load-options";
 import * as React from "react";
 import {
   ChevronsLeft,
@@ -7,12 +9,17 @@ import {
   Loader2,
   Pause,
   Play,
+  RefreshCw,
 } from "lucide-react";
 
 import { DemoInfoDialog } from "@/components/demo-info-dialog";
 import { EventLog } from "@/components/event-log";
 import { HeatmapView } from "@/components/heatmap-view";
-import { TimelineView } from "@/components/timeline-view";
+import { useReplayProbability } from "@/ml/use-replay-probability";
+import { WinProbabilityCard } from "@/components/win-probability-card";
+import { loadReplay, type LoadingProgress } from "@/wasm/load-replay";
+import type { ReplayProbability } from "@/ml/types";
+import { TimelinePanel } from "@/components/timeline-panel";
 import { LaneView } from "@/components/lane-view";
 import { PickupStore } from "@/wasm/pickups";
 import type { CatalogInfo } from "@/wasm/catalog";
@@ -47,12 +54,7 @@ import {
   type SinnerMachineState,
 } from "@/components/map-view";
 import { PlaybackConfig, SPEED_OPTIONS } from "@/components/playback-config";
-import {
-  PlayerDetail,
-  type AbilityCooldown,
-  type ChargeState,
-  type CooldownSpan,
-} from "@/components/player-detail";
+import { PlayerDetail } from "@/components/player-detail";
 import {
   PlayerRoster,
   TEAM_COLORS,
@@ -70,9 +72,10 @@ import {
   TooltipTrigger,
 } from "@/components/ui/tooltip";
 import { cn } from "@/lib/utils";
+import { buildAbilityCooldowns } from "@/lib/ability-state";
 import { regulationTicksAt } from "@/lib/replay-clock";
 import { objectivesAt } from "@/lib/objectives";
-import { disposeDemo, parseDemoFile, type MatchSummary } from "@/wasm/boon";
+import { disposeDemo, type MatchSummary } from "@/wasm/boon";
 import type { StatusStore } from "@/wasm/statuses";
 import type { FrameStore } from "@/wasm/frames";
 import {
@@ -104,15 +107,20 @@ function demoModeLabel(gameMode: number, matchMode: number): DemoMode {
   return matchMode === 4 ? "Ranked" : "Standard";
 }
 
+type ReplayResume = { tick: number; heroId: number | null; statGroup: StatGroup };
+
 type State =
   | { kind: "idle" }
   | {
       kind: "parsing";
       name: string;
-      progress?: { tick: number; total: number; phase?: string };
+      progress?: LoadingProgress;
     }
   | {
       kind: "done";
+      probability: ReplayProbability;
+      options: ReplayLoadOptions;
+      resume?: ReplayResume;
       file: File;
       name: string;
       header: unknown;
@@ -147,9 +155,12 @@ type State =
 
 export function UploadZone() {
   const [state, setState] = React.useState<State>({ kind: "idle" });
+  const [options, setOptions] = React.useState<ReplayLoadOptions>({ ...DEFAULT_LOAD_OPTIONS });
+  const [probabilityTimeline, setProbabilityTimeline] = React.useState(false);
   const { setDemoLoaded, setDemoMode } = useViewMode();
+  const loading = React.useRef<AbortController | null>(null);
   const loadedMode = state.kind === "done" ? state.mode : null;
-  React.useEffect(() => () => { disposePlayerDetails(); disposeDemo(); }, []);
+  React.useEffect(() => () => { loading.current?.abort(); disposePlayerDetails(); disposeDemo(); }, []);
 
   // The header's view switcher and mode badge only appear after parsing.
   React.useEffect(() => {
@@ -157,19 +168,23 @@ export function UploadZone() {
     setDemoMode(loadedMode);
   }, [state.kind, loadedMode, setDemoLoaded, setDemoMode]);
 
-  async function handleFile(file: File) {
+  async function handleFile(file: File, selectedOptions = options, resume?: ReplayResume) {
+    setOptions({ ...selectedOptions });
+    loading.current?.abort();
+    const controller = new AbortController();
+    loading.current = controller;
     disposePlayerDetails();
     setState({ kind: "parsing", name: file.name });
     try {
-      const parsed = await parseDemoFile(file, SAMPLE_EVERY_TICKS, (tick, total, phase) => {
-        setState((s) =>
-          s.kind === "parsing"
-            ? { kind: "parsing", name: s.name, progress: { tick, total, phase } }
-            : s,
-        );
-      });
+      const { parsed, probability } = await loadReplay(file, SAMPLE_EVERY_TICKS, (progress) => {
+        if (!controller.signal.aborted) setState({ kind: "parsing", name: file.name, progress });
+      }, controller.signal, selectedOptions);
+      if (controller.signal.aborted) return;
       setState({
         kind: "done",
+        probability,
+        options: { ...selectedOptions },
+        resume,
         file,
         name: file.name,
         header: parsed.header,
@@ -204,6 +219,7 @@ export function UploadZone() {
         catalog: parsed.catalog,
       });
     } catch (err) {
+      if (controller.signal.aborted) return;
       setState({
         kind: "error",
         message: err instanceof Error ? err.message : String(err),
@@ -214,6 +230,12 @@ export function UploadZone() {
   if (state.kind === "done") {
     return (
       <DemoView
+        loadOptions={state.options}
+        resume={state.resume}
+        onReparse={(next, resume) => { void handleFile(state.file, next, resume); }}
+        probabilityTimeline={probabilityTimeline}
+        onProbabilityTimelineChange={setProbabilityTimeline}
+        initialProbability={state.probability}
         file={state.file}
         name={state.name}
         mode={state.mode}
@@ -246,23 +268,27 @@ export function UploadZone() {
     );
   }
 
-  return <IdleView state={state} onFile={handleFile} />;
+  return <IdleView state={state} onFile={(file) => { void handleFile(file); }} options={options} onOptionsChange={setOptions} />;
 }
 
 function IdleView({
   state,
+  options,
+  onOptionsChange,
   onFile,
 }: {
   state: Extract<State, { kind: "idle" | "parsing" | "error" }>;
   onFile: (f: File) => void;
+  options: ReplayLoadOptions;
+  onOptionsChange: (value: ReplayLoadOptions) => void;
 }) {
   const [dragging, setDragging] = React.useState(false);
   const inputRef = React.useRef<HTMLInputElement>(null);
   const parsing = state.kind === "parsing";
   const prog = state.kind === "parsing" ? state.progress : undefined;
   const pct =
-    prog && !prog.phase && prog.total > 0
-      ? Math.min(100, (prog.tick / prog.total) * 100)
+    prog && prog.total > 0
+      ? Math.min(100, (prog.completed / prog.total) * 100)
       : null;
 
   return (
@@ -272,12 +298,12 @@ function IdleView({
           Deadlock demo viewer
         </h1>
         <p className="mt-2 text-muted-foreground">
-          Select a <code className="font-mono text-sm">.dem</code> replay — it
-          parses right in your browser in a few seconds. No Steam login needed.
+          Select a <code className="font-mono text-sm">.dem</code> replay and choose what to load. Processing stays on your device.
         </p>
       </div>
 
-      <div className="w-full max-w-2xl">
+      <div className="w-full max-w-2xl space-y-4">
+        <ReplayOptionsFields value={options} onChange={onOptionsChange} disabled={parsing} />
         <div
           role="button"
           tabIndex={parsing ? -1 : 0}
@@ -333,12 +359,9 @@ function IdleView({
                   />
                 </div>
                 <p className="mt-2 font-mono text-xs tabular-nums text-muted-foreground">
-                  {prog?.phase ? "preparing replay…" : prog
-                    ? `tick ${prog.tick.toLocaleString()}` +
-                      (prog.total > 0
-                        ? ` / ${prog.total.toLocaleString()}`
-                        : "")
-                    : "starting…"}
+                  {prog && pct != null
+                    ? `${Math.round(pct)}% · ${prog.completed.toLocaleString()} / ${prog.total.toLocaleString()} ${prog.unit ?? ""}`
+                    : "preparing replay…"}
                 </p>
               </>
             ) : (
@@ -397,6 +420,8 @@ function formatClock(totalSeconds: number): string {
 }
 
 function DemoView({
+  loadOptions, resume, onReparse, probabilityTimeline, onProbabilityTimelineChange,
+  initialProbability,
   file,
   name,
   mode,
@@ -426,6 +451,12 @@ function DemoView({
   permanentBuffs,
   catalog,
 }: {
+  initialProbability: ReplayProbability;
+  loadOptions: ReplayLoadOptions;
+  resume?: ReplayResume;
+  onReparse: (options: ReplayLoadOptions, resume: ReplayResume) => void;
+  probabilityTimeline: boolean;
+  onProbabilityTimelineChange: (value: boolean) => void;
   file: File;
   name: string;
   mode: DemoMode;
@@ -455,23 +486,26 @@ function DemoView({
   permanentBuffs: PickupStore;
   catalog: CatalogInfo;
 }) {
-  const [index, setIndex] = React.useState(0);
+  const probability = useReplayProbability(file, initialProbability);
+  const [index, setIndex] = React.useState(() => resume ? Math.max(0, frames.indexAtOrAfter(resume.tick)) : 0);
+  const [optionsOpen, setOptionsOpen] = React.useState(false);
   const [playing, setPlaying] = React.useState(false);
   const [infoOpen, setInfoOpen] = React.useState(false);
   // Configurable via the playback-settings popover.
   const [playbackSpeed, setPlaybackSpeed] = React.useState(1);
   const [stepTicks, setStepTicks] = React.useState(STEP_TICKS);
   // Roster stat columns, chosen by the Stats control above the rosters:
-  // Basic (combat/economy), Advanced (KP/uptime), Econ (souls), Position
-  // (distance/time in enemy half).
-  const [statGroup, setStatGroup] = React.useState<StatGroup>("basic");
-  const [selectedHeroId, setSelectedHeroId] = React.useState<number | null>(
-    null,
-  );
+  // Live recorded state, Basic combat/economy, Advanced, Econ, and movement.
+  const [statGroup, setStatGroup] = React.useState<StatGroup>(resume?.statGroup ?? "live");
+  const [selectedHeroId, setSelectedHeroId] = React.useState<number | null>(resume?.heroId ?? null);
   const safeIndex = Math.min(index, Math.max(0, frames.length - 1));
   const frame = frames.at(safeIndex);
 
   const { view } = useViewMode();
+  const reparse = (next: ReplayLoadOptions) => onReparse(next, { tick: frame?.tick ?? 0, heroId: selectedHeroId, statGroup });
+  const enableModifiers = () => reparse({ ...loadOptions, modifiers: true });
+  const enableProbability = () => reparse({ ...loadOptions, winProbability: true });
+
 
   const selectedPlayer =
     selectedHeroId != null
@@ -490,7 +524,7 @@ function DemoView({
   const detailTick = playing ? undefined : frame?.tick;
 
   React.useEffect(() => {
-    if (!selectedPlayer?.steam_id || (!playing && detailTick == null)) {
+    if (!loadOptions.modifiers || !selectedPlayer?.steam_id || (!playing && detailTick == null)) {
       setPlayerDetails(null);
       return;
     }
@@ -525,7 +559,7 @@ function DemoView({
       controller.abort();
       window.clearTimeout(timeout);
     };
-  }, [file, detailTick, playing, selectedPlayer?.steam_id]);
+  }, [file, detailTick, playing, selectedPlayer?.steam_id, loadOptions.modifiers]);
 
   React.useEffect(() => () => disposePlayerDetails(), [file]);
   const selectedDetails = playerDetails?.steamId === selectedPlayer?.steam_id ? playerDetails : null;
@@ -716,87 +750,9 @@ function DemoView({
     return m;
   }, [abilitySlots]);
 
-  // Reconstruct each ability's cooldown + charge state from the change-only
-  // ability_ticks. All the *_start/_end fields are game-time seconds; a row is
-  // emitted on the tick a state change happens, so we anchor at that tick and
-  // add the duration (`end - start`) — epoch- and pause-independent. A later
-  // same-window change (cooldown reduction, a charge tick) keeps the anchor
-  // tick and just moves the end. `maxCharges` (max remaining_charges seen) ≥ 2
-  // marks a charge-based ability. Built once.
-  const abilityCooldownsByHero = React.useMemo(() => {
-    const groups = new Map<string, AbilityTick[]>();
-    for (const r of abilityTicks) {
-      const k = `${r.hero_id}:${r.ability_id}`;
-      let arr = groups.get(k);
-      if (!arr) {
-        arr = [];
-        groups.set(k, arr);
-      }
-      arr.push(r);
-    }
-    const byHero = new Map<number, Map<number, AbilityCooldown>>();
-    for (const [k, rows] of groups) {
-      const cooldowns: CooldownSpan[] = [];
-      let castStart: number | null = null;
-      const charges: ChargeState[] = [];
-      // Game-time start of the charge currently regenerating, anchored to the
-      // tick it began so a later non-charge change doesn't reset its progress.
-      let rcStartGt: number | null = null;
-      let rcAnchorTick = 0;
-      let maxCharges = 0;
-      for (const r of rows) {
-        const cs = r.cooldown_start;
-        const ce = r.cooldown_end;
-        // Cooldown spans (cast-anchored).
-        if (ce <= cs) {
-          castStart = null; // not on cooldown
-        } else if (castStart === cs && cooldowns.length > 0) {
-          const span = cooldowns[cooldowns.length - 1];
-          span.total = ce - cs;
-          span.end = span.start + (ce - cs) * TICKS_PER_SECOND;
-        } else {
-          castStart = cs;
-          cooldowns.push({
-            start: r.tick,
-            end: r.tick + (ce - cs) * TICKS_PER_SECOND,
-            total: ce - cs,
-          });
-        }
-        // Charge timeline (recharge-window-anchored).
-        if (r.remaining_charges > maxCharges) maxCharges = r.remaining_charges;
-        const rs = r.charge_recharge_start;
-        const re = r.charge_recharge_end;
-        const recharging = re > rs;
-        if (recharging) {
-          if (rcStartGt !== rs) {
-            rcStartGt = rs;
-            rcAnchorTick = r.tick;
-          }
-        } else {
-          rcStartGt = null;
-        }
-        charges.push({
-          startTick: r.tick,
-          count: r.remaining_charges,
-          rechargeStart: rcAnchorTick,
-          rechargeEnd: recharging
-            ? rcAnchorTick + (re - rs) * TICKS_PER_SECOND
-            : r.tick,
-          recharging,
-        });
-      }
-      const sep = k.indexOf(":");
-      const hero = Number(k.slice(0, sep));
-      const ability = Number(k.slice(sep + 1));
-      let m = byHero.get(hero);
-      if (!m) {
-        m = new Map();
-        byHero.set(hero, m);
-      }
-      m.set(ability, { maxCharges, cooldowns, charges });
-    }
-    return byHero;
-  }, [abilityTicks]);
+  const abilityCooldownsByHero = React.useMemo(() => buildAbilityCooldowns(
+    abilityTicks, (tick) => regulationTicksAt(frames, tick, pauseIntervals),
+  ), [abilityTicks, frames, pauseIntervals]);
 
   // Replay sparse upgrade events up to the current tick to get each ability's
   // level now (same approach as items — abilities only change a few times).
@@ -1099,6 +1055,7 @@ function DemoView({
       ) {
         return;
       }
+      if (t?.closest('[role="switch"], [data-timeline-event], [data-timeline-filter], [role="dialog"], [data-reparse-control]')) return;
       if (e.code === "Space" || e.key === " ") {
         e.preventDefault(); // stop page scroll and button re-activation
         togglePlayRef.current();
@@ -1140,6 +1097,8 @@ function DemoView({
         {view === "map" &&
           (selectedPlayer ? (
           <PlayerDetail
+            modifiersEnabled={loadOptions.modifiers}
+            onEnableModifiers={enableModifiers}
             player={selectedPlayer}
             stats={statsByHero.get(selectedPlayer.hero_id)}
             items={itemsByHero.get(selectedPlayer.hero_id)}
@@ -1161,7 +1120,7 @@ function DemoView({
             }}
           />
         ) : (
-          <div className="flex min-h-0 min-w-[20rem] flex-1 flex-col gap-2">
+          <div className="flex min-h-0 min-w-[20rem] flex-1 flex-col gap-2 overflow-y-auto">
             <div className="flex w-full items-center justify-between gap-2">
               <span className="text-xs font-medium uppercase tracking-wide text-muted-foreground">
                 Stats
@@ -1171,6 +1130,9 @@ function DemoView({
                 onValueChange={(v) => setStatGroup(v as StatGroup)}
               >
                 <TabsList className="h-7">
+                  <TabsTrigger value="live" className="px-2 text-xs">
+                    Live
+                  </TabsTrigger>
                   <TabsTrigger value="basic" className="px-2 text-xs">
                     Basic
                   </TabsTrigger>
@@ -1194,6 +1156,9 @@ function DemoView({
               align="left"
               winner={winner}
               statGroup={statGroup}
+              abilities={abilitiesByHero}
+              cooldowns={abilityCooldownsByHero}
+              tick={frame?.reg_ticks ?? 0}
               onSelect={setSelectedHeroId}
             />
             <PlayerRoster
@@ -1204,8 +1169,19 @@ function DemoView({
               align="left"
               winner={winner}
               statGroup={statGroup}
+              abilities={abilitiesByHero}
+              cooldowns={abilityCooldownsByHero}
+              tick={frame?.reg_ticks ?? 0}
               onSelect={setSelectedHeroId}
             />
+            {statGroup === "live" && <WinProbabilityCard
+              players={players} killEvents={killEvents} objectiveEvents={objectiveEvents}
+              probability={probability} onRetry={probability.retry} onEnable={enableProbability}
+              currentTick={frame?.tick ?? firstTick} firstTick={firstTick}
+              lastTick={frames.tickAt(frames.length - 1) ?? firstTick}
+              onSeek={seekToTick} formatTick={formatRegulationTick}
+            />}
+
           </div>
           ))}
         {view === "heatmap" ? (
@@ -1217,10 +1193,12 @@ function DemoView({
             objectives={objectives}
             objectiveEvents={objectiveEvents}
             statuses={statuses}
+            modifiersEnabled={loadOptions.modifiers}
+            onEnableModifiers={enableModifiers}
             pauseIntervals={pauseIntervals}
           />
         ) : view === "timeline" ? (
-          <TimelineView players={players} summary={summary} />
+          <TimelinePanel enabled={probabilityTimeline} onEnabledChange={onProbabilityTimelineChange} onEnable={enableProbability} killEvents={killEvents} objectiveEvents={objectiveEvents} probability={probability} onRetry={probability.retry} players={players} summary={summary} currentTick={frame?.tick ?? firstTick} firstTick={firstTick} lastTick={frames.tickAt(frames.length - 1) ?? firstTick} onSeek={seekToTick} formatTick={formatRegulationTick} />
         ) : view === "matrix" ? (
           <MatrixView players={players} summary={summary} />
         ) : view === "lanes" ? (
@@ -1307,7 +1285,7 @@ function DemoView({
         )}
       </div>
 
-      {view === "map" && (
+      {(view === "map" || view === "timeline") && (
       <div className="flex flex-shrink-0 items-center gap-2">
         <Tooltip>
           <TooltipTrigger asChild>
@@ -1373,6 +1351,7 @@ function DemoView({
             pauseIntervals={pauseIntervals}
           />
         </div>
+        <Button variant="outline" size="icon" aria-label="Replay loading options" data-reparse-control className="size-7" onClick={() => setOptionsOpen(true)}><RefreshCw className="size-3.5" /></Button>
         <PlaybackConfig
           speed={playbackSpeed}
           onSpeedChange={setPlaybackSpeed}
@@ -1396,6 +1375,7 @@ function DemoView({
       </div>
       )}
 
+      {optionsOpen && <ReplayOptionsDialog value={loadOptions} onClose={() => setOptionsOpen(false)} onApply={reparse} />}
       <DemoInfoDialog
         catalog={catalog}
         open={infoOpen}
