@@ -1,4 +1,5 @@
 /// <reference lib="webworker" />
+import type { ProbabilityRequest, ProbabilityResponse } from "../ml/types";
 
 import { loadBoonCatalog, selectBoonCatalog, type CatalogInfo } from "./catalog";
 import type { PlayerDetails, PlayerDetailsRequest, PlayerDetailsResponse } from "./player-details";
@@ -12,6 +13,7 @@ export type ParseRequest = {
   id: number;
   bytes: ArrayBuffer;
   sampleEvery: number;
+  modifiers: boolean;
   catalogBase: string;
 };
 
@@ -39,11 +41,15 @@ interface BoonModule {
     playerPositions(
       sampleEvery: number,
       progress: (tick: number, total: number) => void,
+      modifiers?: boolean,
     ): unknown;
     summary(): unknown;
     playerStatusHistory(ticks: Int32Array): unknown;
     prepareStats(): boolean;
     playerDetails(tick: number, steamId: string): PlayerDetails;
+    prepareWinProbability(roster: [string, number][], progress: (tick: number, total: number) => void): number;
+    winProbabilityBatch(start: number, count: number): import("../ml/types").RawGraph[];
+    clearWinProbability(): void;
     free(): void;
   };
 }
@@ -90,11 +96,40 @@ function loadModule(): Promise<BoonModule> {
   return modulePromise;
 }
 
-self.onmessage = async (e: MessageEvent<ParseRequest | PlayerDetailsRequest>) => {
+let probabilityGeneration = 0;
+let probabilityRequestId: number | undefined;
+let probabilityTask: Promise<void> = Promise.resolve();
+let modifiersEnabled = false;
+let probabilityRoster: [string, number][] = [];
+self.onmessage = async (e: MessageEvent<ParseRequest | PlayerDetailsRequest | ProbabilityRequest>) => {
+  if (e.data.type === "cancel-probability") {
+    if (e.data.id === probabilityRequestId) probabilityGeneration++;
+    return;
+  }
+  if (e.data.type === "win-probability") {
+    const { id, modelBase } = e.data;
+    const generation = ++probabilityGeneration;
+    probabilityRequestId = id;
+    probabilityTask = probabilityTask.catch(() => {}).then(async () => {
+      if (generation !== probabilityGeneration) return;
+      try {
+        if (!parser) throw new Error("Load a replay before calculating win probability");
+        const { inferWinProbability } = await import("../ml/inference");
+        const probabilities = await inferWinProbability(parser, probabilityRoster, modelBase,
+          (probabilityProgress) => self.postMessage({ id, probabilityProgress } satisfies ProbabilityResponse),
+          () => generation !== probabilityGeneration);
+        self.postMessage({ id, ok: true, probabilities } satisfies ProbabilityResponse);
+      } catch (error) {
+        self.postMessage({ id, ok: false, error: error instanceof Error ? error.message : String(error) } satisfies ProbabilityResponse);
+      }
+    });
+    return;
+  }
   if (e.data.type === "details") {
     const { id, tick, steamId } = e.data;
     try {
       if (!parser) throw new Error("Load a demo before querying stats");
+      if (!modifiersEnabled) throw new Error("Enable statuses/modifiers and reparse this replay.");
       self.postMessage({ id, ok: true, details: parser.playerDetails(tick, steamId) } satisfies PlayerDetailsResponse);
     } catch (error) {
       self.postMessage({ id, ok: false, error: error instanceof Error ? error.message : String(error) } satisfies PlayerDetailsResponse);
@@ -103,6 +138,7 @@ self.onmessage = async (e: MessageEvent<ParseRequest | PlayerDetailsRequest>) =>
   }
   const { id, sampleEvery } = e.data;
   try {
+    modifiersEnabled = e.data.modifiers;
     const mod = await loadModule();
     let input: Uint8Array | null = new Uint8Array(e.data.bytes);
     // wasm-bindgen copies the file into WASM synchronously. Drop every
@@ -128,14 +164,20 @@ self.onmessage = async (e: MessageEvent<ParseRequest | PlayerDetailsRequest>) =>
     const positions = parser.playerPositions(
       sampleEvery,
       onProgress,
+      modifiersEnabled,
     ) as Record<string, unknown>;
-    self.postMessage({ id, progress: true, tick: 0, total: 1, phase: "Indexing recorded statuses" } satisfies ParseResponse);
-    const statuses = parser.playerStatusHistory(positions.frame_ticks as Int32Array);
-    self.postMessage({ id, progress: true, tick: 0, total: 1, phase: "Preparing player modifiers and statuses" } satisfies ParseResponse);
-    const checkpointed = parser.prepareStats();
+    let statuses: unknown = { values: [], players: [] };
+    let checkpointed = false;
+    if (modifiersEnabled) {
+      self.postMessage({ id, progress: true, tick: 0, total: 1, phase: "Indexing recorded statuses" } satisfies ParseResponse);
+      statuses = parser.playerStatusHistory(positions.frame_ticks as Int32Array);
+      self.postMessage({ id, progress: true, tick: 0, total: 1, phase: "Preparing player modifiers and statuses" } satisfies ParseResponse);
+      checkpointed = parser.prepareStats();
+    }
     // Roster and winner are collected in the entity/event pass above. Remove
     // them from the positions payload so they have one owner on the main thread.
     const players = positions.players;
+    probabilityRoster = (players as { steam_id: string; team: number }[]).map(p => [p.steam_id, p.team]);
     const winner = (positions.winner as number | null | undefined) ?? null;
     delete positions.players;
     delete positions.winner;

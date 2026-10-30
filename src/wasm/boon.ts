@@ -1,3 +1,5 @@
+import { DEFAULT_LOAD_OPTIONS, type ReplayLoadOptions } from "./load-options";
+import type { ProbabilityProgress, ProbabilityRequest, ProbabilityResponse, ProbabilityResult } from "../ml/types";
 import type { PositionsResult } from "@/components/map-view";
 import type { PlayerInfo } from "@/components/player-roster";
 import { FrameStore, type PackedFrameData } from "./frames";
@@ -126,7 +128,10 @@ function unpackPositions(raw: PackedPositionsResult): PositionsResult {
 let worker: Worker | null = null;
 let nextId = 0;
 let loadedFile: File | undefined;
+let loadedOptions: Readonly<ReplayLoadOptions> = DEFAULT_LOAD_OPTIONS;
 const detailRequests = new Map<number, { resolve: (v: PlayerDetails) => void; reject: (e: Error) => void }>();
+const probabilityRequests = new Map<number, { resolve: (v: ProbabilityResult) => void; reject: (e: Error) => void; progress: (p: ProbabilityProgress) => void }>();
+const probabilityCache = new WeakMap<File, ProbabilityResult>();
 const pending = new Map<
   number,
   {
@@ -141,8 +146,19 @@ function getWorker(): Worker {
     worker = new Worker(new URL("./boon-worker.ts", import.meta.url), {
       type: "module",
     });
-    worker.onmessage = (e: MessageEvent<ParseResponse | PlayerDetailsResponse>) => {
+    worker.onmessage = (e: MessageEvent<ParseResponse | PlayerDetailsResponse | ProbabilityResponse>) => {
       const msg = e.data;
+      const probability = probabilityRequests.get(msg.id);
+      if (probability) {
+        if ("probabilityProgress" in msg) probability.progress(msg.probabilityProgress);
+        else if ("ok" in msg) {
+          probabilityRequests.delete(msg.id);
+          if (msg.ok && "probabilities" in msg) probability.resolve(msg.probabilities);
+          else if (!msg.ok) probability.reject(new Error(msg.error));
+        }
+        return;
+      }
+      if ("probabilityProgress" in msg || "probabilities" in msg) return;
       const detail = detailRequests.get(msg.id);
       if (detail && "ok" in msg) {
         detailRequests.delete(msg.id);
@@ -195,12 +211,15 @@ export function disposeDemo(error = new Error("Replay was closed")) {
   loadedFile = undefined;
   for (const request of pending.values()) request.reject(error);
   for (const request of detailRequests.values()) request.reject(error);
+  for (const request of probabilityRequests.values()) request.reject(error);
+  probabilityRequests.clear();
   pending.clear();
   detailRequests.clear();
 }
 
 export function requestPlayerDetails(file: File, tick: number, steamId: string): Promise<PlayerDetails> {
   if (!worker || loadedFile !== file) return Promise.reject(new Error("This demo is not loaded"));
+  if (!loadedOptions.modifiers) return Promise.reject(new Error("Enable statuses/modifiers and reparse this replay to view calculated stats."));
   const id = nextId++;
   return new Promise((resolve, reject) => {
     detailRequests.set(id, { resolve, reject });
@@ -213,10 +232,14 @@ export async function parseDemoFile(
   file: File,
   sampleEvery: number,
   onProgress?: (tick: number, total: number, phase?: string) => void,
+  signal?: AbortSignal,
+  options: Readonly<ReplayLoadOptions> = DEFAULT_LOAD_OPTIONS,
 ): Promise<ParsedDemo> {
+  if (signal?.aborted) throw new DOMException("Loading cancelled", "AbortError");
   disposeDemo();
   const bytes = new Uint8Array(await file.arrayBuffer());
-  return parseDemo(bytes, sampleEvery, onProgress, file);
+  if (signal?.aborted) throw new DOMException("Loading cancelled", "AbortError");
+  return parseDemo(bytes, sampleEvery, onProgress, file, options);
 }
 
 export function parseDemo(
@@ -224,9 +247,11 @@ export function parseDemo(
   sampleEvery: number,
   onProgress?: (tick: number, total: number, phase?: string) => void,
   file?: File,
+  options: Readonly<ReplayLoadOptions> = DEFAULT_LOAD_OPTIONS,
 ): Promise<ParsedDemo> {
   disposeDemo();
   loadedFile = file;
+  loadedOptions = { ...options };
   const w = getWorker();
   const id = nextId++;
   return new Promise<ParsedDemo>((resolve, reject) => {
@@ -236,10 +261,34 @@ export function parseDemo(
       id,
       bytes: bytes.buffer as ArrayBuffer,
       sampleEvery,
+      modifiers: options.modifiers,
       catalogBase: boonCatalogBase(document.baseURI),
     };
     // Transfer the buffer to avoid copying; the original Uint8Array is
     // consumed and shouldn't be used after this call.
     w.postMessage(req, [req.bytes]);
+  });
+}
+
+
+export function requestWinProbability(file: File, progress: (p: ProbabilityProgress) => void, signal: AbortSignal): Promise<ProbabilityResult> {
+  if (signal.aborted) return Promise.reject(new DOMException("Prediction cancelled", "AbortError"));
+  if (!worker || loadedFile !== file) return Promise.reject(new Error("This demo is not loaded"));
+  if (!loadedOptions.winProbability) return Promise.reject(new Error("Enable win probability and reparse this replay."));
+  const cached = probabilityCache.get(file);
+  if (cached) return Promise.resolve(cached);
+  const id = nextId++;
+  return new Promise<ProbabilityResult>((resolve, reject) => {
+    const abort = () => {
+      probabilityRequests.delete(id);
+      worker?.postMessage({ type: "cancel-probability", id } satisfies ProbabilityRequest);
+      reject(new DOMException("Prediction cancelled", "AbortError"));
+    };
+    signal.addEventListener("abort", abort, { once: true });
+    probabilityRequests.set(id, {
+      resolve: (result) => { signal.removeEventListener("abort", abort); probabilityCache.set(file, result); resolve(result); },
+      reject: (error) => { signal.removeEventListener("abort", abort); reject(error); }, progress,
+    });
+    worker!.postMessage({ type: "win-probability", id, modelBase: new URL("models/win-probability/", document.baseURI).href } satisfies ProbabilityRequest);
   });
 }

@@ -1,3 +1,6 @@
+import { PlayerLiveState } from "./player-live-state";
+import type { AbilitySlot } from "./map-view";
+import type { AbilityCooldown } from "@/lib/ability-state";
 import * as React from "react";
 import { Trophy } from "lucide-react";
 
@@ -137,7 +140,7 @@ const damagePerWorth = new Intl.NumberFormat(undefined, {
   maximumSignificantDigits: 2,
 });
 
-export type StatGroup = "basic" | "advanced" | "econ" | "position";
+export type StatGroup = "live" | "basic" | "advanced" | "econ" | "position";
 
 // Total columns per group — matches Basic and Advanced, the widest sets.
 const GROUP_WIDTH = 5;
@@ -269,14 +272,8 @@ function pad(columns: StatColumn[]): StatColumn[] {
   return out;
 }
 
-const STAT_GROUPS: Record<StatGroup, StatColumn[]> = {
-  basic: pad([
-    K_COLUMN,
-    D_COLUMN,
-    A_COLUMN,
-    SOUL_COLUMN,
-    DMG_COLUMN,
-  ]),
+const STAT_GROUPS: Record<Exclude<StatGroup, "live">, StatColumn[]> = {
+  basic: pad([K_COLUMN, D_COLUMN, A_COLUMN, SOUL_COLUMN, DMG_COLUMN]),
   advanced: pad([
     KP_COLUMN,
     UPT_COLUMN,
@@ -305,7 +302,13 @@ function DiffBadge({ value }: { value: number }) {
   );
 }
 
-function HeroCell({ player }: { player: PlayerInfo }) {
+function HeroCell({
+  player,
+  compact = false,
+}: {
+  player: PlayerInfo;
+  compact?: boolean;
+}) {
   const url = heroPortraitUrl(player.hero_id);
   const [errored, setErrored] = React.useState(false);
   return (
@@ -314,14 +317,22 @@ function HeroCell({ player }: { player: PlayerInfo }) {
         <img
           src={url}
           alt={player.hero_name}
-          width={28}
-          height={28}
+          width={compact ? 20 : 28}
+          height={compact ? 20 : 28}
           loading="lazy"
           onError={() => setErrored(true)}
-          className="size-7 flex-shrink-0 rounded object-contain"
+          className={cn(
+            "flex-shrink-0 rounded object-contain",
+            compact ? "size-5" : "size-7",
+          )}
         />
       ) : (
-        <div className="size-7 flex-shrink-0 rounded bg-muted" />
+        <div
+          className={cn(
+            "flex-shrink-0 rounded bg-muted",
+            compact ? "size-5" : "size-7",
+          )}
+        />
       )}
       <span className="min-w-0 truncate">{player.hero_name || "—"}</span>
     </div>
@@ -335,7 +346,10 @@ export function PlayerRoster({
   team,
   align,
   winner,
-  statGroup = "basic",
+  statGroup = "live",
+  abilities,
+  cooldowns,
+  tick = 0,
   onSelect,
 }: {
   roster: PlayerInfo[];
@@ -345,9 +359,12 @@ export function PlayerRoster({
   align: "left" | "right";
   winner?: number | null;
   statGroup?: StatGroup;
+  abilities?: Map<number, AbilitySlot[]>;
+  cooldowns?: Map<number, Map<number, AbilityCooldown>>;
+  tick?: number;
   onSelect: (heroId: number) => void;
 }) {
-  const columns = STAT_GROUPS[statGroup];
+  const columns = statGroup === "live" ? [] : STAT_GROUPS[statGroup];
   const teamRoster = roster.filter((p) => p.team === team);
   const accent = TEAM_COLORS[team] ?? "#888";
   const logo = assetUrl(TEAM_LOGOS[team]);
@@ -435,10 +452,27 @@ export function PlayerRoster({
       </div>
 
       <div className="overflow-hidden rounded-md border border-border bg-card">
-        <table className="w-full text-xs tabular-nums">
+        <table
+          className={cn(
+            "w-full text-xs tabular-nums",
+            statGroup === "live" && "table-fixed",
+          )}
+        >
           <thead className="bg-muted text-muted-foreground">
             <tr>
-              <th className="px-2 py-1.5 text-left font-medium">Hero</th>
+              <th
+                className={cn(
+                  "px-2 text-left font-medium",
+                  statGroup === "live" ? "w-[34%] py-1 text-[10px]" : "py-1.5",
+                )}
+              >
+                Hero
+              </th>
+              {statGroup === "live" && (
+                <th className="px-2 py-1 text-left text-[10px] font-medium">
+                  Health / barrier & abilities
+                </th>
+              )}
               {columns.map((c, i) => (
                 <th
                   key={c.key}
@@ -463,7 +497,7 @@ export function PlayerRoster({
             {teamRoster.length === 0 ? (
               <tr>
                 <td
-                  colSpan={columns.length + 1}
+                  colSpan={statGroup === "live" ? 2 : columns.length + 1}
                   className="px-2 py-2 text-center text-muted-foreground"
                 >
                   —
@@ -482,9 +516,25 @@ export function PlayerRoster({
                     className="cursor-pointer border-t border-border transition-colors hover:bg-accent/40"
                     title={p.name || undefined}
                   >
-                    <td className="px-2 py-1.5">
-                      <HeroCell player={p} />
+                    <td
+                      className={cn(
+                        "px-2",
+                        statGroup === "live" ? "py-0.5" : "py-1.5",
+                      )}
+                    >
+                      <HeroCell player={p} compact={statGroup === "live"} />
                     </td>
+                    {statGroup === "live" && (
+                      <td className="px-2 py-0.5">
+                        <PlayerLiveState
+                          stats={row.live}
+                          abilities={abilities?.get(p.hero_id)}
+                          cooldowns={cooldowns?.get(p.hero_id)}
+                          tick={tick}
+                          color={accent}
+                        />
+                      </td>
+                    )}
                     {columns.map((c, ci) => (
                       <td
                         key={c.key}

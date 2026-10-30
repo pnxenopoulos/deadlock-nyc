@@ -38,6 +38,7 @@ and renders the parsed entities, events, and stats in the browser.
   modifiers, current player statuses, ability imbues, and Boon-calculated
   weapon, vitality, spirit, and per-ability stats with input breakdowns.
   Permanent pickup bonuses and counts are indexed for immediate seeking.
+- **Live roster state** (the default player tab) with health, barrier, and compact ability cooldowns/charges synced to playback.
 - **Timeline stats** — self/teammate healing, healing and regeneration by source, damage taken,
   mitigation, barrier absorption, and creep/objective damage.
 - **Lane phase** — recorded starting assignments, individual/pair totals, and
@@ -49,12 +50,12 @@ and renders the parsed entities, events, and stats in the browser.
 - [React 19](https://react.dev/) + [TypeScript](https://www.typescriptlang.org/)
 - [Vite 6](https://vite.dev/) + [Tailwind CSS 4](https://tailwindcss.com/)
 - [Bun](https://bun.sh/) (package manager + script runner)
-- [boon](https://github.com/pnxenopoulos/boon) 0.16 (Rust), published on crates.io and compiled to
+- [boon](https://github.com/pnxenopoulos/boon) 0.19 (Rust), published on crates.io and compiled to
   WebAssembly with [`wasm-pack`](https://github.com/rustwasm/wasm-pack)
 
 ## Performance and memory
 
-The WASM adapter uses Boon 0.16 and pbdems2 0.4.0. It requests only the event
+The WASM adapter uses Boon 0.19 and pbdems2 0.4.1. It requests only the event
 types used by the UI and uses boon's changed-entity indices for roster and
 objective updates instead of rescanning every live entity each tick.
 
@@ -105,7 +106,7 @@ or its Cargo dependencies change).
 
 ### Stat-query performance checks
 
-Normal builds use Boon's published checkpoint API. Demo loading prepares
+Normal builds use Boon's published checkpoint API. With Statuses/modifiers enabled, demo loading prepares
 up to 16 exact replay checkpoints once; repeated stat queries resume from the
 nearest earlier checkpoint. Recorded statuses are indexed once and update
 immediately. Superseded stat requests are coalesced, and recent results are cached.
@@ -183,3 +184,93 @@ Deadlock and all related game content — imagery, icons, minimaps, hero and ite
 names, and other in-game assets — are the property of Valve Corporation and are
 **not** covered by this license. This is an unofficial, fan-made project that is
 not affiliated with or endorsed by Valve.
+
+
+## Win probability
+
+The Timeline view has a **Win probability** switch on its right, off by default.
+Before choosing a file, loading options let you enable **Statuses/modifiers** and
+**Win probability** independently. Both default off. Basic map playback, recorded
+health/barrier, items, and ability cooldowns remain available. Disabled status
+loading skips modifier-span materialization, status indexing, and calculated-stat
+checkpoints/queries. Minimal modifier transitions still support the Urn and the
+recorded barrier pool; recorded permanent pickups remain available.
+
+Disabled panels show an **Enable … and reparse** action. It reparses the same
+local file with the requested feature and preserves the selected hero, playback
+tick, and timeline selection. The replay loading options button beside playback
+settings can enable or disable either option. Status-dependent heatmap metrics,
+modifiers, statuses, calculated stats, and ability imbues identify missing data.
+
+When win probability is selected, loading includes its computation and reports
+phase/progress before opening the map. It calculates one prediction per active
+second, excluding pauses and game-over/post-game states. A compact, clickable
+curve appears below the Live teams. The full Timeline chart adds solid objective
+lines colored by the destroyed objective's team, dotted deaths colored by the
+victim's team, and solid yellow Mid Boss kill lines. Icon toggles above the chart
+show or hide player kills, objective kills, and Mid Boss independently. Player
+kills start hidden; objectives and Mid Boss start visible. Hover/focus any line
+for team-colored victim/owner and killer rows with hero portraits and event icons;
+nearby events share a tooltip when lines overlap. The compact Live curve has
+matching icon filters and clickable event lines, without event tooltips. Click a
+line in either chart to seek to that event.
+
+Both curves reuse the loading result and follow the replay playhead. If an
+opted-in model fails, playback still opens with a retry; disabled prediction
+requires reparsing rather than silently starting a model job.
+
+Inference runs in the existing Web Worker using ONNX Runtime Web. WebGPU is
+preferred where a compatible adapter is available, using batches of four. Missing
+GPU support, initialization errors, and shader failures fall back to WASM/CPU
+(batches of two). The CPU runtime is loaded separately on devices without a GPU.
+Hosts with cross-origin isolation can use up to four CPU threads; GitHub Pages
+uses one. All runtime assets are served from the same origin as the site.
+The worker reuses the loaded demo/parser and recorded barrier history, extracts
+bounded batches, and frees intermediate ML state afterwards. No replay bytes, graph features, or predictions
+are sent to a server. Dense graph attention is substantial work: the first full
+curve can still take several minutes on a CPU-only/slower device. Progress is
+shown throughout loading.
+
+GitHub release binary downloads lack browser CORS headers. Therefore `bun run model`
+fetches the latest public release of `pnxenopoulos/deadlock-win-prob`, verifies each
+asset digest and the manifest's model/encoder hashes, and writes generated files
+to `public/models/win-probability/`. Both `bun run dev` and `bun run build` run this
+step. GitHub Pages deployment uses its read-only build token to avoid anonymous
+API rate limits; the token is never included in browser code. A site redeploy
+picks up a newly released model. The browser checks hashes again before loading
+and displays the model version. Models requiring a different parser/schema or
+catalog-enriched features fail explicitly rather than inventing inputs.
+
+The browser extractor is matched to Boon 0.19.0 and encoder schema 1, including
+recorded teams, world coordinates, inventories, barriers, objective lifetimes,
+zipline visibility/control, and the training encoder's missing-value rules.
+The original post-match stats and interpolated map frames are not model inputs.
+
+Run the small encoder, lifecycle, and chart tests with `bun test`. A Python-generated
+fixture checks normalization, vocabularies, padding, masks, and connectivity.
+For a full replay parity check, provide the reference JSON generated by dwp and run:
+
+```bash
+bun run wasm
+bun scripts/check-win-probability.ts /path/to/match.dem /path/to/reference-folder
+```
+
+The reference folder contains `roster.json` and `reference.json` with explicit
+ticks, the complete one-second sampling schedule, and dwp-encoded tensors. The
+check canonicalizes node order and compares all tensor values against Python.
+
+### Parsing CPU usage
+
+The replay decoder runs on one Web Worker, without a CPU-percentage cap. Replay
+entity deltas depend on earlier ticks, so the current decoding pass is serial.
+One busy logical core on an eight-logical-core machine can appear as roughly
+12.5% aggregate CPU usage; this alone does not show whether the parser is idle.
+The Rust/WASM release already uses speed optimization, LTO, and wasm-opt -O3.
+
+Map frames and ML snapshots now share the recorded barrier history, removing a
+second full modifier scan without changing feature values. Parallel decoding
+would require independent replay/checkpoint partitions or parallel independent
+passes; it also increases memory requirements. Shared-memory WASM threading
+additionally needs cross-origin isolation, which the current Pages deployment
+does not provide. Increasing ONNX CPU threads would affect inference rather
+than Boon's ordered replay decoding.

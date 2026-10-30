@@ -82,3 +82,11 @@ test("heatmap OUTN shows seconds for the selected hero and the whole-team averag
   const known = render({ ...data, players: data.players.map((p) => ({ ...p, indices: p.indices.map(() => 0) })) }, store, roster);
   expect(statCell(known, "tbody", 4)).toContain(">0.0s</span>");
 });
+
+
+test("disabled status metrics show a reparse notice and unknown combat coverage", () => {
+  const html = renderToStaticMarkup(<TooltipProvider><HeatmapView players={players} frames={frames} statuses={new StatusStore(history)} killEvents={[]} abilityEvents={[]} objectives={[]} objectiveEvents={[]} pauseIntervals={[]} modifiersEnabled={false} onEnableModifiers={() => {}} /></TooltipProvider>);
+  expect(html).toContain("Combat time and outnumbered combat need recorded statuses.");
+  expect(html).toContain("Enable statuses/modifiers and reparse");
+  expect(combatCell(html, "tbody")).toContain(">—</span>");
+});

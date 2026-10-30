@@ -31,10 +31,11 @@ const details: PlayerDetails = {
   ] },
 };
 
-function renderPlayer(playerStatus?: PlayerStatus) {
+function renderPlayer(playerStatus?: PlayerStatus, modifiersEnabled = true) {
   return renderToStaticMarkup(
     <TooltipProvider>
       <PlayerDetail
+        modifiersEnabled={modifiersEnabled} onEnableModifiers={() => {}}
         player={{ name: "Test", steam_id: "76561198405200740", hero_id: 63, hero_name: "Mina", team: 2, rank: 0 }}
         stats={undefined} items={undefined} abilityLevels={undefined}
         abilities={[{ ability_id: 193508101, ability_name: "ability_vampirebat_steallife" }]}
@@ -99,4 +100,13 @@ test("Demo info shows the selected catalog and warns only for known mismatches",
   expect(render("6746")).toContain("6746");
   expect(render("6746")).not.toContain("No bundled catalog");
   expect(render("6759")).toContain("No bundled catalog");
+});
+
+
+test("disabled statuses/modifiers request reparsing rather than reporting no active effects", () => {
+  const html = renderPlayer(status, false);
+  expect(html).toContain("Enable statuses/modifiers and reparse");
+  expect(html).toContain("Recorded cooldowns remain available");
+  expect(html).not.toContain("No active statuses.");
+  expect(html).not.toContain('aria-label="Items imbuing Rake"');
 });

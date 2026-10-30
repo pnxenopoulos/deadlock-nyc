@@ -1,3 +1,4 @@
+use std::cell::OnceCell;
 use std::collections::{HashMap, HashSet};
 
 use boon::Serializer;
@@ -8,6 +9,7 @@ mod barriers;
 mod pickups;
 mod statuses;
 mod summary;
+mod win_probability;
 
 #[wasm_bindgen(start)]
 pub fn init() {
@@ -17,10 +19,23 @@ pub fn init() {
 #[wasm_bindgen]
 pub struct DemoParser {
     inner: boon::Parser,
+    barrier_history: OnceCell<barriers::Barriers>,
+    win_probability: Option<win_probability::Replay>,
     stat_catalog: Option<boon::hero_stats::StatCatalog>,
     state_catalog: Option<boon::player_states::StateCatalog>,
     stat_replay: Option<boon::hero_stats::StatReplay>,
     pickup_catalog: Option<pickups::Catalog>,
+}
+
+impl DemoParser {
+    /// Recorded barriers are shared by map frames and ML snapshots; decode them once per file.
+    fn barriers(&self) -> boon::Result<&barriers::Barriers> {
+        if let Some(history) = self.barrier_history.get() {
+            return Ok(history);
+        }
+        let history = barriers::Barriers::read(&self.inner)?;
+        Ok(self.barrier_history.get_or_init(|| history))
+    }
 }
 
 const PAWN_CLASS: &str = "CCitadelPlayerPawn";
@@ -293,6 +308,8 @@ impl DemoParser {
         inner.verify().map_err(to_js_error)?;
         Ok(Self {
             inner,
+            barrier_history: OnceCell::new(),
+            win_probability: None,
             stat_catalog: None,
             state_catalog: None,
             stat_replay: None,
@@ -599,14 +616,16 @@ impl DemoParser {
         &self,
         sample_every: u32,
         progress: &js_sys::Function,
+        include_modifiers: Option<bool>,
     ) -> Result<JsValue, JsError> {
+        let include_modifiers = include_modifiers.unwrap_or(true);
         let names = catalog_names()?;
         let catalog = self
             .stat_catalog
             .as_ref()
             .ok_or_else(|| JsError::new("load a boon-data catalog first"))?;
         let initial = self.inner.parse_init().map_err(to_js_error)?;
-        let barriers = barriers::Barriers::read(&self.inner).map_err(to_js_error)?;
+        let barriers = self.barriers().map_err(to_js_error)?;
         let pickup_catalog = self
             .pickup_catalog
             .as_ref()
@@ -1544,7 +1563,7 @@ impl DemoParser {
                     }
                 }
 
-                for change in changes {
+                for change in changes.into_iter().filter(|_| include_modifiers) {
                     let serial = change.serial;
                     if change.kind == boon::ModifierChangeKind::Removed {
                         if let Some(open) = mod_open.remove(&serial) {
